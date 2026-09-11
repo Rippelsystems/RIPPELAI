@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rippel Effect AI</title>
+<meta name="description" content="Production and financial intelligence for Rippel Effect Systems">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0f2744">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --navy: #0f2744;
+    --navy-mid: #1a3a5c;
+    --navy-light: #254d7a;
+    --steel: #4a6fa5;
+    --ice: #e8f0fa;
+    --ice-mid: #c8d9f0;
+    --surface: #f5f7fa;
+    --white: #ffffff;
+    --text: #0f2744;
+    --text-mid: #3d5270;
+    --text-muted: #7a8fa8;
+    --border: #d0dcea;
+    --border-strong: #a8bed8;
+    --success: #1a7a4a;
+    --success-bg: #e6f4ed;
+    --warning: #8a5c00;
+    --warning-bg: #fef7e6;
+    --danger: #8a1a1a;
+    --danger-bg: #fae6e6;
+    --radius: 8px;
+    --radius-lg: 14px;
+  }
+
+  html, body { height: 100%; }
+
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--surface);
+    color: var(--text);
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  /* ── HEADER ── */
+  .header {
+    background: var(--navy);
+    padding: 0 20px;
+    height: 56px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-shrink: 0;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+
+  .logo {
+    width: 34px;
+    height: 34px;
+    background: rgba(255,255,255,0.12);
+    border-radius: 7px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: 0.5px;
+    line-height: 1.2;
+    text-align: center;
+    border: 1px solid rgba(255,255,255,0.18);
+  }
+
+  .header-title {
+    color: #fff;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.1px;
+  }
+
+  .header-sub {
+    color: rgba(255,255,255,0.5);
+    font-size: 12px;
+    margin-top: 1px;
+  }
+
+  .header-right {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .status-badge {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 20px;
+    padding: 4px 10px;
+    font-size: 11px;
+    color: rgba(255,255,255,0.7);
+  }
+
+  .status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #4ade80;
+    flex-shrink: 0;
+  }
+
+  .status-dot.offline { background: #f87171; }
+
+  .clear-btn {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: var(--radius);
+    color: rgba(255,255,255,0.6);
+    font-size: 11px;
+    padding: 5px 10px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .clear-btn:hover { background: rgba(255,255,255,0.14); color: #fff; }
+
+  /* ── MAIN LAYOUT ── */
+  .main { display: flex; flex: 1; overflow: hidden; }
+
+  /* ── SIDEBAR ── */
+  .sidebar {
+    width: 220px;
+    background: var(--white);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    overflow-y: auto;
+  }
+
+  .sidebar-section { padding: 16px 14px 8px; }
+
+  .sidebar-label {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.8px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+
+  .quick-btn {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 8px 10px;
+    border-radius: var(--radius);
+    border: 1px solid transparent;
+    background: transparent;
+    font-size: 12.5px;
+    color: var(--text-mid);
+    cursor: pointer;
+    font-family: inherit;
+    line-height: 1.4;
+    margin-bottom: 2px;
+    transition: background 0.1s, border-color 0.1s;
+  }
+  .quick-btn:hover {
+    background: var(--ice);
+    border-color: var(--ice-mid);
+    color: var(--navy);
+  }
+
+  .quick-btn .qb-icon {
+    font-size: 14px;
+    margin-right: 6px;
+    opacity: 0.7;
+  }
+
+  .sidebar-divider {
+    height: 1px;
+    background: var(--border);
+    margin: 8px 14px;
+  }
+
+  .phase-badge {
+    margin: 12px 14px;
+    background: var(--ice);
+    border: 1px solid var(--ice-mid);
+    border-radius: var(--radius);
+    padding: 8px 10px;
+    font-size: 11px;
+    color: var(--text-mid);
+    line-height: 1.5;
+  }
+
+  .phase-badge strong {
+    color: var(--navy);
+    font-weight: 600;
+    display: block;
+    margin-bottom: 2px;
+  }
+
+  /* ── CHAT AREA ── */
+  .chat-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: var(--surface);
+  }
+
+  .messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  /* welcome state */
+  .welcome {
+    margin: auto;
+    text-align: center;
+    max-width: 400px;
+    padding: 40px 20px;
+  }
+
+  .welcome-icon {
+    width: 56px;
+    height: 56px;
+    background: var(--navy);
+    border-radius: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 700;
+    color: #fff;
+    margin: 0 auto 16px;
+    letter-spacing: 0.5px;
+  }
+
+  .welcome h2 {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--navy);
+    margin-bottom: 8px;
+  }
+
+  .welcome p {
+    font-size: 13.5px;
+    color: var(--text-mid);
+    line-height: 1.6;
+  }
+
+  /* messages */
+  .msg-row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .msg-row.user { align-items: flex-end; }
+  .msg-row.ai { align-items: flex-start; }
+
+  .msg-label {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    padding: 0 4px;
+  }
+
+  .msg-bubble {
+    max-width: 75%;
+    padding: 11px 15px;
+    border-radius: var(--radius-lg);
+    font-size: 13.5px;
+    line-height: 1.65;
+  }
+
+  .msg-row.user .msg-bubble {
+    background: var(--navy);
+    color: #fff;
+    border-radius: var(--radius-lg) var(--radius-lg) 3px var(--radius-lg);
+  }
+
+  .msg-row.ai .msg-bubble {
+    background: var(--white);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: var(--radius-lg) var(--radius-lg) var(--radius-lg) 3px;
+  }
+
+  .msg-bubble strong { font-weight: 600; }
+  .msg-bubble em { color: var(--text-mid); font-style: normal; font-size: 12.5px; }
+
+  .msg-bubble .warn-tag {
+    display: inline-block;
+    background: var(--warning-bg);
+    color: var(--warning);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 11.5px;
+    font-weight: 600;
+    margin: 2px 0;
+  }
+
+  .msg-bubble .ok-tag {
+    display: inline-block;
+    background: var(--success-bg);
+    color: var(--success);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 11.5px;
+    font-weight: 600;
+    margin: 2px 0;
+  }
+
+  .msg-bubble .err-tag {
+    display: inline-block;
+    background: var(--danger-bg);
+    color: var(--danger);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 11.5px;
+    font-weight: 600;
+    margin: 2px 0;
+  }
+
+  .thinking-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 4px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+
+  .thinking-dots { display: flex; gap: 4px; }
+
+  .thinking-dots span {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--steel);
+    animation: pulse 1.2s infinite;
+  }
+  .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+  .thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+  @keyframes pulse {
+    0%, 80%, 100% { opacity: 0.2; transform: scale(0.8); }
+    40% { opacity: 1; transform: scale(1); }
+  }
+
+  /* ── INPUT AREA ── */
+  .input-wrapper {
+    border-top: 1px solid var(--border);
+    background: var(--white);
+    padding: 12px 16px 14px;
+    flex-shrink: 0;
+  }
+
+  .input-row {
+    display: flex;
+    gap: 10px;
+    align-items: flex-end;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-lg);
+    padding: 8px 10px 8px 14px;
+    transition: border-color 0.15s;
+  }
+
+  .input-row:focus-within {
+    border-color: var(--steel);
+    background: var(--white);
+  }
+
+  #chatInput {
+    flex: 1;
+    border: none;
+    background: transparent;
+    font-family: inherit;
+    font-size: 13.5px;
+    color: var(--text);
+    resize: none;
+    outline: none;
+    line-height: 1.5;
+    min-height: 22px;
+    max-height: 120px;
+  }
+
+  #chatInput::placeholder { color: var(--text-muted); }
+
+  .send-btn {
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+    background: var(--navy);
+    border: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: background 0.15s;
+  }
+  .send-btn:hover { background: var(--navy-light); }
+  .send-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+  .send-btn svg { width: 16px; height: 16px; fill: none; stroke: #fff; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+  .input-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 7px;
+    padding: 0 2px;
+  }
+
+  .input-hint { font-size: 11px; color: var(--text-muted); }
+  .readonly-tag {
+    font-size: 10.5px;
+    font-weight: 600;
+    color: var(--text-muted);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 7px;
+    letter-spacing: 0.3px;
+  }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header class="header">
+  <div class="logo">RE<br>AI</div>
+  <div>
+    <div class="header-title">Rippel Effect AI</div>
+    <div class="header-sub">Production &amp; financial intelligence</div>
+  </div>
+  <div class="header-right">
+    <div class="status-badge">
+      <div class="status-dot" id="statusDot"></div>
+      <span id="statusText">Live data</span>
+    </div>
+    <button class="clear-btn" onclick="clearChat()">Clear chat</button>
+  </div>
+</header>
+
+<!-- MAIN -->
+<div class="main">
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">RLL production</div>
+      <button class="quick-btn" onclick="ask('How long will it take to build 400 RLL guns and do we have the budget?')">
+        <span class="qb-icon">🔫</span>400 RLL — time &amp; budget?
+      </button>
+      <button class="quick-btn" onclick="ask('Which RLL components are we short on for a 400-unit run?')">
+        <span class="qb-icon">📦</span>RLL stock shortfall
+      </button>
+      <button class="quick-btn" onclick="ask('What is the total material cost to build one RLL rifle based on current pricing?')">
+        <span class="qb-icon">💰</span>Cost per RLL unit
+      </button>
+      <button class="quick-btn" onclick="ask('Which RLL BOM parts have no pricing data?')">
+        <span class="qb-icon">⚠️</span>RLL unpriced parts
+      </button>
+    </div>
+
+    <div class="sidebar-divider"></div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-label">Financial</div>
+      <button class="quick-btn" onclick="ask('What is our total open purchase order value in Rands?')">
+        <span class="qb-icon">📋</span>Total open PO value
+      </button>
+      <button class="quick-btn" onclick="ask('What payment commitments do we have due in the next 60 days?')">
+        <span class="qb-icon">📅</span>Upcoming payments
+      </button>
+      <button class="quick-btn" onclick="ask('Where is prepaid money sitting where goods have not yet arrived?')">
+        <span class="qb-icon">🔒</span>Prepaid POs in limbo
+      </button>
+      <button class="quick-btn" onclick="ask('What is the total value of our current stock on hand?')">
+        <span class="qb-icon">🏭</span>Stock value snapshot
+      </button>
+    </div>
+
+    <div class="sidebar-divider"></div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-label">Other products</div>
+      <button class="quick-btn" onclick="ask('What is the current stock and open PO position for XRGL40 components?')">
+        <span class="qb-icon">🎯</span>XRGL40 position
+      </button>
+      <button class="quick-btn" onclick="ask('What is the current stock and open PO position for GRN40 components?')">
+        <span class="qb-icon">🎯</span>GRN40 position
+      </button>
+    </div>
+
+    <div class="phase-badge">
+      <strong>Phase 1 — Read only</strong>
+      Connected to LIVE Supabase. No data can be changed through this interface.
+    </div>
+  </aside>
+
+  <!-- CHAT -->
+  <div class="chat-area">
+    <div class="messages" id="messages">
+      <div class="welcome" id="welcome">
+        <div class="welcome-icon">RE</div>
+        <h2>What do you want to know?</h2>
+        <p>Ask about production capacity, component shortfalls, budget, open purchase orders, or payment commitments. Use the quick links on the left to get started.</p>
+      </div>
+    </div>
+
+    <div class="input-wrapper">
+      <div class="input-row">
+        <textarea id="chatInput" placeholder="Ask about stock, production, budget..." rows="1"
+          onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+        <button class="send-btn" id="sendBtn" onclick="sendMessage()" aria-label="Send">
+          <svg viewBox="0 0 24 24"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+        </button>
+      </div>
+      <div class="input-footer">
+        <span class="input-hint">Enter to send &nbsp;·&nbsp; Shift+Enter for new line</span>
+        <span class="readonly-tag">READ ONLY</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const SUPABASE_URL = "https://rifargmdjzsqgkttwgoy.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJpZmFyZ21kanpzcWdrdHR3Z295Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4MTMxMjIsImV4cCI6MjA5MzM4OTEyMn0.cECO_hzVVU3PwjIjiTW-FQW1urLNmVpXBh8HmK-1KSs";
+
+const SYSTEM_PROMPT = `You are the production and financial intelligence assistant for Rippel Effect Systems (Pty) Ltd, a South African firearms manufacturer in Johannesburg.
+
+YOUR ROLE:
+Answer questions from the CEO (Fritz) and Finance Manager (Siva) about production capacity, component stock, purchase orders, and financial commitments. Be direct, precise, and honest about gaps in the data.
+
+COMPANY:
+- Products: XRGL40 (40mm grenade launcher), GRN40 (40mm grenade), RLL (rifle)
+- Currency: South African Rand (ZAR). Always show amounts as "R xxx,xxx"
+- Financial year runs January to December
+- Factory is in Johannesburg. Key staff: Fritz (CEO), Siva (Finance), Michiel (Technical Manager), Louis (Stores)
+
+DATABASE TABLES (Supabase/PostgreSQL — REST API available):
+- stock_items: stock_item_id, item_name, internal_part_no, stock_qty, store_name, stock_group
+  * store_name = 'Main Store' for usable stock; Holding Store items have suffixes like _M _C _T (in-process, not yet usable)
+- po_lines: line_ref, po_number, item_name, internal_part_no, qty_ordered, qty_received, unit_price, line_status, prepaid_amount, prepaid_date
+  * line_status: 'Complete' = fully received; 'Open' or 'Backorder' = outstanding
+  * Outstanding qty = qty_ordered - qty_received
+- po_headers: po_number, supplier_name, po_date, po_status, expected_delivery_date
+- component_pricing: internal_part_no, unit_price, supplier_name, last_updated
+  * 101 of 119 RLL parts are priced. 18 have no pricing yet — always flag this.
+- bom_items: product_code, internal_part_no, item_name, qty_required
+  * RLL iBOM: 119 parts, declared as the BUILD BIBLE (RLL_iBOM_2026-05-25)
+  * product_code values include 'RLL', 'XRGL40', 'GRN40'
+- suppliers: supplier_id, supplier_name, country, lead_time_days
+- component_movements: movement_id, stock_item_id, movement_type, qty, movement_date, reference
+
+HOW TO ANSWER:
+1. State what data you found clearly and in plain English
+2. Show key numbers prominently — total costs, quantities, shortfalls
+3. Always flag: unpriced parts, incomplete data, assumptions you made
+4. For "can we build X units" questions: check BOM qty_required × units vs current Main Store stock_qty + outstanding on open POs. Show a shortfall table.
+5. For budget questions: sum (bom qty_required × unit_price from component_pricing) × units. Clearly state how many parts had no price and that the total is therefore a minimum estimate.
+6. Be honest if you cannot query live data in this context — explain what the answer would require and what tables to check.
+7. Keep answers concise. Use line breaks for readability. Bold key numbers.
+
+WHAT YOU CANNOT DO:
+- Modify any data (read only)
+- Access files or Excel spreadsheets
+- See historical chat sessions
+
+TONE: Direct, factual, no corporate filler. Fritz wants numbers, not paragraphs.`;
+
+let history = [];
+let busy = false;
+
+function ask(text) {
+  document.getElementById("chatInput").value = text;
+  sendMessage();
+}
+
+async function sendMessage() {
+  const input = document.getElementById("chatInput");
+  const text = input.value.trim();
+  if (!text || busy) return;
+
+  input.value = "";
+  autoResize(input);
+  hideWelcome();
+
+  addUserMsg(text);
+  history.push({ role: "user", content: text });
+
+  setBusy(true);
+  const thinkEl = addThinking();
+
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1000,
+        system: SYSTEM_PROMPT,
+        messages: history
+      })
+    });
+
+    const data = await res.json();
+    thinkEl.remove();
+
+    if (data.error) {
+      addAIMsg("Error from AI: " + data.error.message);
+    } else {
+      const reply = data.content?.[0]?.text || "No response received.";
+      addAIMsg(reply);
+      history.push({ role: "assistant", content: reply });
+    }
+  } catch (err) {
+    thinkEl.remove();
+    addAIMsg("Connection error: " + err.message + "\n\nCheck your internet connection and try again.");
+  }
+
+  setBusy(false);
+}
+
+function addUserMsg(text) {
+  const msgs = document.getElementById("messages");
+  const row = document.createElement("div");
+  row.className = "msg-row user";
+  row.innerHTML = `<div class="msg-label">You</div><div class="msg-bubble">${escHtml(text)}</div>`;
+  msgs.appendChild(row);
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+function addAIMsg(text) {
+  const msgs = document.getElementById("messages");
+  const row = document.createElement("div");
+  row.className = "msg-row ai";
+  const formatted = formatAI(text);
+  row.innerHTML = `<div class="msg-label">Rippel AI</div><div class="msg-bubble">${formatted}</div>`;
+  msgs.appendChild(row);
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+function addThinking() {
+  const msgs = document.getElementById("messages");
+  const div = document.createElement("div");
+  div.className = "thinking-row";
+  div.innerHTML = `<div class="thinking-dots"><span></span><span></span><span></span></div><span>Querying live data...</span>`;
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+  return div;
+}
+
+function formatAI(text) {
+  return escHtml(text)
+    .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
+    .replace(/⚠️(.*?)(\n|$)/g, '<span class="warn-tag">⚠ $1</span>\n')
+    .replace(/✅(.*?)(\n|$)/g, '<span class="ok-tag">✓ $1</span>\n')
+    .replace(/❌(.*?)(\n|$)/g, '<span class="err-tag">✗ $1</span>\n')
+    .replace(/\n/g, "<br>");
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+function setBusy(on) {
+  busy = on;
+  document.getElementById("sendBtn").disabled = on;
+}
+
+function hideWelcome() {
+  const w = document.getElementById("welcome");
+  if (w) w.remove();
+}
+
+function clearChat() {
+  history = [];
+  const msgs = document.getElementById("messages");
+  msgs.innerHTML = `<div class="welcome" id="welcome">
+    <div class="welcome-icon">RE</div>
+    <h2>What do you want to know?</h2>
+    <p>Ask about production capacity, component shortfalls, budget, open purchase orders, or payment commitments. Use the quick links on the left to get started.</p>
+  </div>`;
+}
+
+function handleKey(e) {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+}
+
+function autoResize(el) {
+  el.style.height = "auto";
+  el.style.height = Math.min(el.scrollHeight, 120) + "px";
+}
+</script>
+</body>
+</html>
