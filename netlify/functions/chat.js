@@ -72,38 +72,34 @@ async function get_rll_shortfall(qty = 1) {
     return { error: `Query failed: ${error.message}` };
   }
 
-  // Scale every row's requirement to the requested build quantity
   const scaledRows = allRows.map(row => ({
     ...row,
     scaled_need: row.need_for_1_rll * qty
   }));
 
-  // Lookup table by component_id, so children can check their parent's status
   const byComponentId = {};
   for (const row of scaledRows) {
     if (row.component_id) byComponentId[row.component_id] = row;
   }
 
   const realShortages = scaledRows.filter(row => {
-    // Structural container nodes (e.g. FRONT GROUP, CYLINDER GROUP) hold no
-    // physical stock of their own and are never a real build blocker.
     if (row.build_status === 'CONTAINER') return false;
 
-    // Enough physically on hand at this build quantity -> not a shortage
     if (row.available_qty >= row.scaled_need) return false;
 
     const parent = row.dependant_code ? byComponentId[row.dependant_code] : null;
 
-    // No parent found -> this is a genuine top-level requirement
     if (!parent) return true;
 
-    // Parent is itself a pure structural container -> it holds no buffer
-    // stock, so the child's own shortage stands as real.
-    if (parent.is_assembly_group) return true;
-
-    // Parent assembly already has enough stock on the shelf -> the
-    // child's raw-material shortage is irrelevant, we're using the
-    // assembled stock, not building more of it from scratch.
+    // The only thing that matters is whether the parent itself already
+    // holds enough physical stock to cover the need — NOT whether it is
+    // flagged is_assembly_group. That flag is unreliable: some real,
+    // physically-stocked sub-assemblies (e.g. TRIGGER GUARD ASSEMBLY,
+    // which can carry hundreds of units in Main Store) are still flagged
+    // is_assembly_group = true, same as pure structural nodes that never
+    // hold stock (e.g. FRONT GROUP). Comparing the parent's own
+    // available_qty against its own need is what actually determines
+    // whether the shelf already covers this requirement.
     if (parent.available_qty >= parent.scaled_need) return false;
 
     return true;
@@ -145,7 +141,6 @@ exports.handler = async function (event) {
     let conversation = [...messages];
     let finalResponse = null;
 
-    // Allow up to 5 tool-call round trips per request
     for (let i = 0; i < 5; i++) {
       const apiResponse = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -181,7 +176,7 @@ exports.handler = async function (event) {
         }
 
         conversation.push({ role: 'user', content: toolResults });
-        continue; // loop again so Claude can respond using the tool result
+        continue;
       }
 
       finalResponse = data;
