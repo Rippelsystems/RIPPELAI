@@ -42,6 +42,14 @@ IMPORTANT DATA RULES:
 - If a component's immediate parent assembly already has enough stock on
   its own to cover the full need, a raw-material shortage on that component
   is NOT a real build blocker at all.
+- "Other store stock" (other_store_stock) means units of the same part
+  code that exist in another product's store (e.g. XRGL Store or GRN40
+  Store). These are NOT automatically available for RLL — a management
+  decision and physical transfer would be required. Always flag this
+  clearly as "available in other product stores — transfer required" and
+  never treat it as equivalent to RLL Store stock. But always report it
+  when it exists, because it may allow Fritz or Michiel to expedite by
+  authorising an internal transfer rather than waiting for a new order.
 - Never guess or estimate figures. Always call the appropriate tool to get
   real data. If a tool returns no data or an error, say so plainly rather
   than filling in a plausible-sounding number.
@@ -59,10 +67,11 @@ const TOOLS = [
       + 'structural BOM container nodes (assembly groupings with no '
       + 'physical stock of their own), excludes raw-material shortages '
       + 'whose parent assembly already has sufficient stock on hand, and '
-      + 'correctly accounts for partial parent coverage (e.g. if 244 '
-      + 'assemblies already exist for a 400-unit build, child parts only '
-      + 'need to cover the remaining 156). Use this whenever asked about '
-      + 'RLL stock readiness, build blockers, or what is missing to build RLL.',
+      + 'correctly accounts for partial parent coverage. Also reports '
+      + 'whether any short parts have stock sitting in other product stores '
+      + '(XRGL, GRN40) that could be transferred. Use this whenever asked '
+      + 'about RLL stock readiness, build blockers, or what is missing to '
+      + 'build RLL.',
     input_schema: {
       type: 'object',
       properties: {
@@ -90,12 +99,27 @@ const TOOLS = [
 ];
 
 async function get_rll_shortfall(qty = 1) {
+  // Main BOM readiness query
   const { data: allRows, error } = await supabase
     .from('v_rll_build_readiness')
     .select('component_id, dependant_code, item_name, stock_code, storeroom, available_qty, holding_qty, on_order_qty, supplier_earliest_eta, need_for_1_rll, req_per_unit, shortfall, build_status, is_assembly_group');
 
   if (error) {
     return { error: `Query failed: ${error.message}` };
+  }
+
+  // Cross-store availability: same stock_code held in other product stores
+  const { data: crossStoreRows } = await supabase
+    .from('stock_items')
+    .select('stock_code, stock_qty, storeroom')
+    .in('storeroom', ['XRGL Store', 'GRN40 Store', 'RLL Legacy Store'])
+    .gt('stock_qty', 0);
+
+  // Build cross-store map: base stock_code → total qty across other product stores
+  const crossStoreMap = {};
+  for (const row of (crossStoreRows || [])) {
+    const code = row.stock_code ? row.stock_code.split('_')[0] : '';
+    if (code) crossStoreMap[code] = (crossStoreMap[code] || 0) + row.stock_qty;
   }
 
   const scaledRows = allRows.map(row => ({
@@ -111,8 +135,7 @@ async function get_rll_shortfall(qty = 1) {
   // Compute effective need for a child row.
   // If the parent assembly already has some units built on the shelf, the child
   // only needs to cover the parent's REMAINING GAP × child's req_per_unit —
-  // not the full scaled_need. This prevents falsely reporting a shortage on a
-  // raw part when the parent assembly already has most of what is needed.
+  // not the full scaled_need.
   function getEffectiveNeed(row) {
     const parent = row.dependant_code ? byComponentId[row.dependant_code] : null;
     if (!parent) return row.scaled_need;
@@ -125,27 +148,32 @@ async function get_rll_shortfall(qty = 1) {
       if (row.build_status === 'CONTAINER') return false;
 
       const parent = row.dependant_code ? byComponentId[row.dependant_code] : null;
-
-      // If parent already has enough stock on hand, child shortage is irrelevant
       if (parent && parent.available_qty >= parent.scaled_need) return false;
 
-      // Only report if something genuinely still needs sourcing from scratch
-      // after accounting for available, WIP in Holding Store, and on-order
       const need = getEffectiveNeed(row);
       const needsSourcing = Math.max(0, need - row.available_qty - row.holding_qty - row.on_order_qty);
       return needsSourcing > 0;
     })
     .map(r => {
       const need = getEffectiveNeed(r);
+      const needsSourcing = Math.max(0, need - r.available_qty - r.holding_qty - r.on_order_qty);
+      const crossStore = crossStoreMap[r.stock_code] || 0;
+
       return {
         item_name: r.item_name,
         stock_code: r.stock_code,
         available: r.available_qty,
         holding_wip: r.holding_qty,
-        needed: need,
         on_order: r.on_order_qty,
         supplier_eta: r.supplier_earliest_eta,
-        needs_sourcing: Math.max(0, need - r.available_qty - r.holding_qty - r.on_order_qty)
+        needed: need,
+        needs_sourcing: needsSourcing,
+        other_store_stock: crossStore,
+        other_store_note: crossStore >= needsSourcing
+          ? 'Fully covered by other product store stock — management transfer required'
+          : crossStore > 0
+            ? `${crossStore} available in other product stores — partial cover, transfer required`
+            : null
       };
     });
 
