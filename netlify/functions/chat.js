@@ -36,26 +36,29 @@ IMPORTANT DATA RULES:
   on_order from the effective need.
 - If a parent assembly already has partial stock on the shelf, the child
   raw parts only need to cover the parent's REMAINING gap — not the full
-  build quantity. Example: if you need 400 assemblies and already have 244
-  built, you only need to build 156 more, so the raw parts only need to
-  cover 156 units worth, not 400.
+  build quantity.
 - If a component's immediate parent assembly already has enough stock on
   its own to cover the full need, a raw-material shortage on that component
   is NOT a real build blocker at all.
-- "Other store stock" (other_store_stock) means units of the same part
-  code that exist in another product's store (e.g. XRGL Store or GRN40
-  Store). These are NOT automatically available for RLL — a management
-  decision and physical transfer would be required. Always flag this
-  clearly as "available in other product stores — transfer required" and
-  never treat it as equivalent to RLL Store stock. But always report it
-  when it exists, because it may allow Fritz or Michiel to expedite by
-  authorising an internal transfer rather than waiting for a new order.
-- Never guess or estimate figures. Always call the appropriate tool to get
-  real data. If a tool returns no data or an error, say so plainly rather
-  than filling in a plausible-sounding number.
+- "Other store stock" means units of the same part code held in another
+  product's store (XRGL, GRN40). NOT automatically available for RLL —
+  always flag as "transfer required, management authorisation needed."
+- For PO values and payment schedules, always distinguish:
+    1. GROSS outstanding = total value of goods not yet received
+    2. ALREADY PAID = lines where invoice_paid=true (cash already out,
+       goods still en route) — these are NOT future cash obligations
+    3. PREPAID DEPOSITS = prepaid_amount already paid on unpaid lines
+    4. NET STILL OWED = gross unpaid - prepaid deposits = actual future
+       cash obligation
+  Always lead with NET STILL OWED for cashflow conversations. The gross
+  figure is misleading on its own.
+- "committed_date" is the supplier's confirmed delivery ETA and the best
+  proxy for when payment will be due. Overdue lines (committed_date in the
+  past, still open and unpaid) are a priority — flag them prominently.
+- Never guess or estimate figures. Always call the appropriate tool.
 - Always state currency as R (ZAR) for any monetary figure.
 - Lines with no unit_price are excluded from value totals — always flag
-  how many unpriced lines exist so the user knows the total may be understated.
+  how many unpriced lines exist so the user knows totals may be understated.
 - Be concise and direct. These are busy operational stakeholders who need
   clear answers, not lengthy explanations.`;
 
@@ -64,8 +67,7 @@ const TOOLS = [
     name: 'get_rll_shortfall',
     description: 'Returns the genuine, actionable stock shortages preventing '
       + 'a build of N units of RLL right now (default 1). Excludes '
-      + 'structural BOM container nodes (assembly groupings with no '
-      + 'physical stock of their own), excludes raw-material shortages '
+      + 'structural BOM container nodes, excludes raw-material shortages '
       + 'whose parent assembly already has sufficient stock on hand, and '
       + 'correctly accounts for partial parent coverage. Also reports '
       + 'whether any short parts have stock sitting in other product stores '
@@ -84,38 +86,51 @@ const TOOLS = [
   },
   {
     name: 'get_open_po_value',
-    description: 'Returns the total ZAR value of all open (outstanding) purchase '
-      + 'order lines — i.e. everything ordered but not yet fully received. '
-      + 'Also returns the count of lines, how many have no unit price (and '
-      + 'are therefore excluded from the total), and the total prepaid amount '
-      + 'already paid against open lines. Use this whenever asked about total '
-      + 'open PO value, how much is on order, outstanding commitments, or '
-      + 'overall purchasing exposure.',
+    description: 'Returns the true cash position on all open purchase orders: '
+      + 'gross outstanding value, how much is already paid (invoice settled '
+      + 'but goods not yet received), prepaid deposits on unpaid lines, and '
+      + 'the net amount still owed. Use this for total open PO exposure, '
+      + 'outstanding financial commitments, or cashflow questions about '
+      + 'what still needs to be paid.',
     input_schema: {
       type: 'object',
       properties: {}
+    }
+  },
+  {
+    name: 'get_payment_schedule',
+    description: 'Returns upcoming unpaid supplier deliveries and their net '
+      + 'cash requirement within the next N days (default 30), based on '
+      + 'committed delivery dates. Only includes lines not yet invoiced and '
+      + 'paid. Shows gross value, prepaid deposits already made, and net '
+      + 'cash still required. Also separately reports overdue unpaid lines. '
+      + 'Use this for upcoming cashflow, what is due from suppliers, or '
+      + 'overdue PO lines.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        days: {
+          type: 'integer',
+          description: 'Number of days ahead to look. Defaults to 30.'
+        }
+      }
     }
   }
 ];
 
 async function get_rll_shortfall(qty = 1) {
-  // Main BOM readiness query
   const { data: allRows, error } = await supabase
     .from('v_rll_build_readiness')
     .select('component_id, dependant_code, item_name, stock_code, storeroom, available_qty, holding_qty, on_order_qty, supplier_earliest_eta, need_for_1_rll, req_per_unit, shortfall, build_status, is_assembly_group');
 
-  if (error) {
-    return { error: `Query failed: ${error.message}` };
-  }
+  if (error) return { error: `Query failed: ${error.message}` };
 
-  // Cross-store availability: same stock_code held in other product stores
   const { data: crossStoreRows } = await supabase
     .from('stock_items')
     .select('stock_code, stock_qty, storeroom')
     .in('storeroom', ['XRGL Store', 'GRN40 Store', 'RLL Legacy Store'])
     .gt('stock_qty', 0);
 
-  // Build cross-store map: base stock_code → total qty across other product stores
   const crossStoreMap = {};
   for (const row of (crossStoreRows || [])) {
     const code = row.stock_code ? row.stock_code.split('_')[0] : '';
@@ -132,10 +147,6 @@ async function get_rll_shortfall(qty = 1) {
     if (row.component_id) byComponentId[row.component_id] = row;
   }
 
-  // Compute effective need for a child row.
-  // If the parent assembly already has some units built on the shelf, the child
-  // only needs to cover the parent's REMAINING GAP × child's req_per_unit —
-  // not the full scaled_need.
   function getEffectiveNeed(row) {
     const parent = row.dependant_code ? byComponentId[row.dependant_code] : null;
     if (!parent) return row.scaled_need;
@@ -146,10 +157,8 @@ async function get_rll_shortfall(qty = 1) {
   const realShortages = scaledRows
     .filter(row => {
       if (row.build_status === 'CONTAINER') return false;
-
       const parent = row.dependant_code ? byComponentId[row.dependant_code] : null;
       if (parent && parent.available_qty >= parent.scaled_need) return false;
-
       const need = getEffectiveNeed(row);
       const needsSourcing = Math.max(0, need - row.available_qty - row.holding_qty - row.on_order_qty);
       return needsSourcing > 0;
@@ -158,7 +167,6 @@ async function get_rll_shortfall(qty = 1) {
       const need = getEffectiveNeed(r);
       const needsSourcing = Math.max(0, need - r.available_qty - r.holding_qty - r.on_order_qty);
       const crossStore = crossStoreMap[r.stock_code] || 0;
-
       return {
         item_name: r.item_name,
         stock_code: r.stock_code,
@@ -190,28 +198,115 @@ async function get_open_po_value() {
     .from('v_open_po_value')
     .select('po_number, description, line_status, qty_outstanding, unit_price, line_value, committed_date, invoice_paid, prepaid_amount');
 
-  if (error) {
-    return { error: `Query failed: ${error.message}` };
-  }
+  if (error) return { error: `Query failed: ${error.message}` };
 
-  const totalValue    = data.reduce((sum, r) => sum + (r.line_value     || 0), 0);
-  const totalPrepaid  = data.reduce((sum, r) => sum + (r.prepaid_amount  || 0), 0);
-  const unpricedCount = data.filter(r => !r.unit_price || r.unit_price === 0).length;
+  // Split: already paid (invoice settled, goods still en route) vs unpaid
+  const paidLines   = data.filter(r => r.invoice_paid === true);
+  const unpaidLines = data.filter(r => r.invoice_paid !== true);
+
+  const grossTotal        = data.reduce((sum, r)       => sum + (r.line_value     || 0), 0);
+  const alreadyPaidValue  = paidLines.reduce((sum, r)  => sum + (r.line_value     || 0), 0);
+  const grossUnpaid       = unpaidLines.reduce((sum, r) => sum + (r.line_value    || 0), 0);
+  const totalPrepaid      = unpaidLines.reduce((sum, r) => sum + (r.prepaid_amount || 0), 0);
+  const netStillOwed      = Math.max(0, grossUnpaid - totalPrepaid);
+  const unpricedCount     = data.filter(r => !r.unit_price || r.unit_price === 0).length;
 
   return {
-    total_open_po_value_zar: totalValue,
-    total_line_count: data.length,
-    unpriced_line_count: unpricedCount,
-    total_prepaid_zar: totalPrepaid,
-    note: unpricedCount > 0
-      ? `${unpricedCount} line(s) have no unit price and are excluded from the total — actual exposure is higher`
-      : null
+    net_still_owed_zar: netStillOwed,
+    breakdown: {
+      gross_outstanding_zar: grossTotal,
+      already_invoiced_and_paid_zar: alreadyPaidValue,
+      prepaid_deposits_on_unpaid_lines_zar: totalPrepaid,
+      gross_unpaid_zar: grossUnpaid
+    },
+    line_counts: {
+      total_open_lines: data.length,
+      already_paid_lines: paidLines.length,
+      unpaid_lines: unpaidLines.length,
+      unpriced_lines: unpricedCount
+    },
+    notes: [
+      paidLines.length > 0
+        ? `${paidLines.length} line(s) totalling R${alreadyPaidValue.toFixed(2)} are invoiced and paid — cash already out, goods still en route`
+        : null,
+      totalPrepaid > 0
+        ? `R${totalPrepaid.toFixed(2)} in prepaid deposits already made on unpaid lines — deducted from net owed`
+        : null,
+      unpricedCount > 0
+        ? `${unpricedCount} line(s) have no unit price and are excluded from all totals — actual exposure is higher`
+        : null
+    ].filter(Boolean)
+  };
+}
+
+async function get_payment_schedule(days = 30) {
+  const { data, error } = await supabase
+    .from('v_payment_schedule')
+    .select('po_number, description, line_status, committed_date, qty_outstanding, unit_price, line_value, prepaid_amount, invoice_paid');
+
+  if (error) return { error: `Query failed: ${error.message}` };
+
+  // Only unpaid lines are future cash obligations
+  const unpaidData = data.filter(r => r.invoice_paid !== true);
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const cutoff = new Date(today);
+  cutoff.setDate(cutoff.getDate() + days);
+
+  const dueLines = unpaidData.filter(r => {
+    const d = new Date(r.committed_date);
+    return d >= today && d <= cutoff;
+  });
+
+  const overdueLines = unpaidData.filter(r => {
+    const d = new Date(r.committed_date);
+    return d < today;
+  });
+
+  const dueGross      = dueLines.reduce((sum, r)      => sum + (r.line_value     || 0), 0);
+  const duePrepaid    = dueLines.reduce((sum, r)      => sum + (r.prepaid_amount  || 0), 0);
+  const dueNet        = Math.max(0, dueGross - duePrepaid);
+  const overdueGross  = overdueLines.reduce((sum, r)  => sum + (r.line_value     || 0), 0);
+  const overduePrepaid = overdueLines.reduce((sum, r) => sum + (r.prepaid_amount  || 0), 0);
+  const overdueNet    = Math.max(0, overdueGross - overduePrepaid);
+  const unpricedDue   = dueLines.filter(r => !r.unit_price || r.unit_price === 0).length;
+
+  // Group due lines by date
+  const byDate = {};
+  for (const r of dueLines) {
+    const d = r.committed_date;
+    if (!byDate[d]) byDate[d] = { date: d, line_count: 0, gross_zar: 0, net_zar: 0 };
+    byDate[d].line_count++;
+    byDate[d].gross_zar += r.line_value || 0;
+    byDate[d].net_zar   += Math.max(0, (r.line_value || 0) - (r.prepaid_amount || 0));
+  }
+
+  return {
+    period_days: days,
+    due_in_period: {
+      line_count: dueLines.length,
+      gross_value_zar: dueGross,
+      prepaid_deposits_zar: duePrepaid,
+      net_cash_required_zar: dueNet,
+      unpriced_lines: unpricedDue,
+      by_date: Object.values(byDate).sort((a, b) => a.date.localeCompare(b.date))
+    },
+    overdue_unpaid: {
+      line_count: overdueLines.length,
+      gross_value_zar: overdueGross,
+      net_cash_required_zar: overdueNet,
+      note: overdueLines.length > 0
+        ? 'Past committed delivery date, unpaid, still open — follow up with suppliers urgently'
+        : 'No overdue unpaid lines'
+    }
   };
 }
 
 async function runTool(name, input) {
-  if (name === 'get_rll_shortfall') return get_rll_shortfall(input.qty || 1);
-  if (name === 'get_open_po_value') return get_open_po_value();
+  if (name === 'get_rll_shortfall')    return get_rll_shortfall(input.qty || 1);
+  if (name === 'get_open_po_value')    return get_open_po_value();
+  if (name === 'get_payment_schedule') return get_payment_schedule(input.days || 30);
   return { error: `Unknown tool: ${name}` };
 }
 
@@ -247,7 +342,6 @@ exports.handler = async function (event) {
 
       if (data.stop_reason === 'tool_use') {
         const toolUseBlocks = data.content.filter(b => b.type === 'tool_use');
-
         conversation.push({ role: 'assistant', content: data.content });
 
         const toolResults = [];
