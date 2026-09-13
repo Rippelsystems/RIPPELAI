@@ -15,7 +15,6 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // ---- System prompt ----
-// This is the business context Claude needs on every request.
 const SYSTEM_PROMPT = `You are RippelAI, an internal financial and production
 intelligence assistant for Rippel Effect Systems, a South African firearms
 manufacturer. Your users are Fritz (CEO/MD), Siva (Finance), and Michiel
@@ -45,11 +44,12 @@ const TOOLS = [
   {
     name: 'get_rll_shortfall',
     description: 'Returns the genuine, actionable stock shortages preventing '
-      + 'a build of 1 unit of RLL right now. Excludes structural BOM '
-      + 'container nodes and excludes raw-material shortages whose parent '
-      + 'assembly already has sufficient stock on hand. Use this whenever '
-      + 'asked about RLL stock readiness, build blockers, or what is '
-      + 'missing to build RLL.',
+      + 'a build of N units of RLL right now (default 1). Excludes '
+      + 'structural BOM container nodes (assembly groupings with no '
+      + 'physical stock of their own) and excludes raw-material shortages '
+      + 'whose parent assembly already has sufficient stock on hand. Use '
+      + 'this whenever asked about RLL stock readiness, build blockers, or '
+      + 'what is missing to build RLL.',
     input_schema: {
       type: 'object',
       properties: {
@@ -66,32 +66,44 @@ const TOOLS = [
 async function get_rll_shortfall(qty = 1) {
   const { data: allRows, error } = await supabase
     .from('v_rll_build_readiness')
-    .select('component_id, dependant_code, item_name, stock_code, storeroom, available_qty, on_order_qty, supplier_earliest_eta, need_for_1_rll, shortfall, build_status');
+    .select('component_id, dependant_code, item_name, stock_code, storeroom, available_qty, on_order_qty, supplier_earliest_eta, need_for_1_rll, shortfall, build_status, is_assembly_group');
 
   if (error) {
     return { error: `Query failed: ${error.message}` };
   }
 
-  const byComponentId = {};
-  for (const row of allRows) {
-    if (row.component_id) byComponentId[row.component_id] = row;
-  }
-
+  // Scale every row's requirement to the requested build quantity
   const scaledRows = allRows.map(row => ({
     ...row,
     scaled_need: row.need_for_1_rll * qty
   }));
 
-  const scaledByComponentId = {};
+  // Lookup table by component_id, so children can check their parent's status
+  const byComponentId = {};
   for (const row of scaledRows) {
-    if (row.component_id) scaledByComponentId[row.component_id] = row;
+    if (row.component_id) byComponentId[row.component_id] = row;
   }
 
   const realShortages = scaledRows.filter(row => {
-    if (row.available_qty >= row.scaled_need) return false; // enough on hand at this qty
+    // Structural container nodes (e.g. FRONT GROUP, CYLINDER GROUP) hold no
+    // physical stock of their own and are never a real build blocker.
+    if (row.build_status === 'CONTAINER') return false;
 
-    const parent = row.dependant_code ? scaledByComponentId[row.dependant_code] : null;
+    // Enough physically on hand at this build quantity -> not a shortage
+    if (row.available_qty >= row.scaled_need) return false;
+
+    const parent = row.dependant_code ? byComponentId[row.dependant_code] : null;
+
+    // No parent found -> this is a genuine top-level requirement
     if (!parent) return true;
+
+    // Parent is itself a pure structural container -> it holds no buffer
+    // stock, so the child's own shortage stands as real.
+    if (parent.is_assembly_group) return true;
+
+    // Parent assembly already has enough stock on the shelf -> the
+    // child's raw-material shortage is irrelevant, we're using the
+    // assembled stock, not building more of it from scratch.
     if (parent.available_qty >= parent.scaled_need) return false;
 
     return true;
