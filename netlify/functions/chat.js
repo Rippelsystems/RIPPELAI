@@ -33,16 +33,21 @@ IMPORTANT DATA RULES:
   step to completion — NOT to raise a new purchase order. Only report
   "needs sourcing from scratch" (needs_sourcing) for the quantity that is
   genuinely unaccounted for after subtracting available + holding_wip +
-  on_order from the total needed.
+  on_order from the effective need.
+- If a parent assembly already has partial stock on the shelf, the child
+  raw parts only need to cover the parent's REMAINING gap — not the full
+  build quantity. Example: if you need 400 assemblies and already have 244
+  built, you only need to build 156 more, so the raw parts only need to
+  cover 156 units worth, not 400.
 - If a component's immediate parent assembly already has enough stock on
-  its own, a raw-material shortage on that component is NOT a real build
-  blocker — the business will use the assembled stock on the shelf rather
-  than build more of that assembly from scratch. Only report genuine,
-  actionable shortages.
+  its own to cover the full need, a raw-material shortage on that component
+  is NOT a real build blocker at all.
 - Never guess or estimate figures. Always call the appropriate tool to get
   real data. If a tool returns no data or an error, say so plainly rather
   than filling in a plausible-sounding number.
 - Always state currency as R (ZAR) for any monetary figure.
+- Lines with no unit_price are excluded from value totals — always flag
+  how many unpriced lines exist so the user knows the total may be understated.
 - Be concise and direct. These are busy operational stakeholders who need
   clear answers, not lengthy explanations.`;
 
@@ -52,10 +57,12 @@ const TOOLS = [
     description: 'Returns the genuine, actionable stock shortages preventing '
       + 'a build of N units of RLL right now (default 1). Excludes '
       + 'structural BOM container nodes (assembly groupings with no '
-      + 'physical stock of their own) and excludes raw-material shortages '
-      + 'whose parent assembly already has sufficient stock on hand. Use '
-      + 'this whenever asked about RLL stock readiness, build blockers, or '
-      + 'what is missing to build RLL.',
+      + 'physical stock of their own), excludes raw-material shortages '
+      + 'whose parent assembly already has sufficient stock on hand, and '
+      + 'correctly accounts for partial parent coverage (e.g. if 244 '
+      + 'assemblies already exist for a 400-unit build, child parts only '
+      + 'need to cover the remaining 156). Use this whenever asked about '
+      + 'RLL stock readiness, build blockers, or what is missing to build RLL.',
     input_schema: {
       type: 'object',
       properties: {
@@ -65,13 +72,27 @@ const TOOLS = [
         }
       }
     }
+  },
+  {
+    name: 'get_open_po_value',
+    description: 'Returns the total ZAR value of all open (outstanding) purchase '
+      + 'order lines — i.e. everything ordered but not yet fully received. '
+      + 'Also returns the count of lines, how many have no unit price (and '
+      + 'are therefore excluded from the total), and the total prepaid amount '
+      + 'already paid against open lines. Use this whenever asked about total '
+      + 'open PO value, how much is on order, outstanding commitments, or '
+      + 'overall purchasing exposure.',
+    input_schema: {
+      type: 'object',
+      properties: {}
+    }
   }
 ];
 
 async function get_rll_shortfall(qty = 1) {
   const { data: allRows, error } = await supabase
     .from('v_rll_build_readiness')
-    .select('component_id, dependant_code, item_name, stock_code, storeroom, available_qty, holding_qty, on_order_qty, supplier_earliest_eta, need_for_1_rll, shortfall, build_status, is_assembly_group');
+    .select('component_id, dependant_code, item_name, stock_code, storeroom, available_qty, holding_qty, on_order_qty, supplier_earliest_eta, need_for_1_rll, req_per_unit, shortfall, build_status, is_assembly_group');
 
   if (error) {
     return { error: `Query failed: ${error.message}` };
@@ -87,50 +108,82 @@ async function get_rll_shortfall(qty = 1) {
     if (row.component_id) byComponentId[row.component_id] = row;
   }
 
-  const realShortages = scaledRows.filter(row => {
-    if (row.build_status === 'CONTAINER') return false;
-
-    if (row.available_qty >= row.scaled_need) return false;
-
+  // Compute effective need for a child row.
+  // If the parent assembly already has some units built on the shelf, the child
+  // only needs to cover the parent's REMAINING GAP × child's req_per_unit —
+  // not the full scaled_need. This prevents falsely reporting a shortage on a
+  // raw part when the parent assembly already has most of what is needed.
+  function getEffectiveNeed(row) {
     const parent = row.dependant_code ? byComponentId[row.dependant_code] : null;
+    if (!parent) return row.scaled_need;
+    if (parent.available_qty >= parent.scaled_need) return 0;
+    return Math.max(0, parent.scaled_need - parent.available_qty) * row.req_per_unit;
+  }
 
-    if (!parent) return true;
+  const realShortages = scaledRows
+    .filter(row => {
+      if (row.build_status === 'CONTAINER') return false;
 
-    // The only thing that matters is whether the parent itself already
-    // holds enough physical stock to cover the need — NOT whether it is
-    // flagged is_assembly_group. That flag is unreliable: some real,
-    // physically-stocked sub-assemblies (e.g. TRIGGER GUARD ASSEMBLY,
-    // which can carry hundreds of units in Main Store) are still flagged
-    // is_assembly_group = true, same as pure structural nodes that never
-    // hold stock (e.g. FRONT GROUP). Comparing the parent's own
-    // available_qty against its own need is what actually determines
-    // whether the shelf already covers this requirement.
-    if (parent.available_qty >= parent.scaled_need) return false;
+      const parent = row.dependant_code ? byComponentId[row.dependant_code] : null;
 
-    return true;
-  });
+      // If parent already has enough stock on hand, child shortage is irrelevant
+      if (parent && parent.available_qty >= parent.scaled_need) return false;
+
+      // Only report if something genuinely still needs sourcing from scratch
+      // after accounting for available, WIP in Holding Store, and on-order
+      const need = getEffectiveNeed(row);
+      const needsSourcing = Math.max(0, need - row.available_qty - row.holding_qty - row.on_order_qty);
+      return needsSourcing > 0;
+    })
+    .map(r => {
+      const need = getEffectiveNeed(r);
+      return {
+        item_name: r.item_name,
+        stock_code: r.stock_code,
+        available: r.available_qty,
+        holding_wip: r.holding_qty,
+        needed: need,
+        on_order: r.on_order_qty,
+        supplier_eta: r.supplier_earliest_eta,
+        needs_sourcing: Math.max(0, need - r.available_qty - r.holding_qty - r.on_order_qty)
+      };
+    });
 
   return {
     product: 'RLL',
     build_qty: qty,
     total_shortages: realShortages.length,
-    shortages: realShortages.map(r => ({
-      item_name: r.item_name,
-      stock_code: r.stock_code,
-      available: r.available_qty,
-      holding_wip: r.holding_qty,
-      needed: r.scaled_need,
-      on_order: r.on_order_qty,
-      supplier_eta: r.supplier_earliest_eta,
-      needs_sourcing: Math.max(0, r.scaled_need - r.available_qty - r.holding_qty - r.on_order_qty)
-    }))
+    shortages: realShortages
+  };
+}
+
+async function get_open_po_value() {
+  const { data, error } = await supabase
+    .from('v_open_po_value')
+    .select('po_number, description, line_status, qty_outstanding, unit_price, line_value, committed_date, invoice_paid, prepaid_amount');
+
+  if (error) {
+    return { error: `Query failed: ${error.message}` };
+  }
+
+  const totalValue    = data.reduce((sum, r) => sum + (r.line_value     || 0), 0);
+  const totalPrepaid  = data.reduce((sum, r) => sum + (r.prepaid_amount  || 0), 0);
+  const unpricedCount = data.filter(r => !r.unit_price || r.unit_price === 0).length;
+
+  return {
+    total_open_po_value_zar: totalValue,
+    total_line_count: data.length,
+    unpriced_line_count: unpricedCount,
+    total_prepaid_zar: totalPrepaid,
+    note: unpricedCount > 0
+      ? `${unpricedCount} line(s) have no unit price and are excluded from the total — actual exposure is higher`
+      : null
   };
 }
 
 async function runTool(name, input) {
-  if (name === 'get_rll_shortfall') {
-    return get_rll_shortfall(input.qty || 1);
-  }
+  if (name === 'get_rll_shortfall') return get_rll_shortfall(input.qty || 1);
+  if (name === 'get_open_po_value') return get_open_po_value();
   return { error: `Unknown tool: ${name}` };
 }
 
