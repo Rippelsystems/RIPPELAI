@@ -7,14 +7,12 @@
 
 const { createClient } = require('@supabase/supabase-js');
 
-// ---- Config (from Netlify environment variables) ----
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// ---- System prompt ----
 const SYSTEM_PROMPT = `You are RippelAI, an internal financial and production
 intelligence assistant for Rippel Effect Systems, a South African firearms
 manufacturer. Your users are Fritz (CEO/MD), Siva (Finance), and Michiel
@@ -27,6 +25,15 @@ IMPORTANT DATA RULES:
   count as available stock. Only physically available stock (Main Store or
   pooled COTS Store quantities) counts toward whether something is ready
   to build right now.
+- "Holding Store WIP" (holding_wip) is stock that physically exists and
+  has already been paid for, but is currently mid-process (e.g. machining,
+  anodizing, external service) and is NOT yet usable in a build. Always
+  report this separately from available stock and from on-order stock.
+  The correct action for a holding_wip shortage is to chase the in-process
+  step to completion — NOT to raise a new purchase order. Only report
+  "needs sourcing from scratch" (needs_sourcing) for the quantity that is
+  genuinely unaccounted for after subtracting available + holding_wip +
+  on_order from the total needed.
 - If a component's immediate parent assembly already has enough stock on
   its own, a raw-material shortage on that component is NOT a real build
   blocker — the business will use the assembled stock on the shelf rather
@@ -39,7 +46,6 @@ IMPORTANT DATA RULES:
 - Be concise and direct. These are busy operational stakeholders who need
   clear answers, not lengthy explanations.`;
 
-// ---- Tool definitions Claude can call ----
 const TOOLS = [
   {
     name: 'get_rll_shortfall',
@@ -62,11 +68,10 @@ const TOOLS = [
   }
 ];
 
-// ---- Tool implementation ----
 async function get_rll_shortfall(qty = 1) {
   const { data: allRows, error } = await supabase
     .from('v_rll_build_readiness')
-    .select('component_id, dependant_code, item_name, stock_code, storeroom, available_qty, on_order_qty, supplier_earliest_eta, need_for_1_rll, shortfall, build_status, is_assembly_group');
+    .select('component_id, dependant_code, item_name, stock_code, storeroom, available_qty, holding_qty, on_order_qty, supplier_earliest_eta, need_for_1_rll, shortfall, build_status, is_assembly_group');
 
   if (error) {
     return { error: `Query failed: ${error.message}` };
@@ -113,15 +118,15 @@ async function get_rll_shortfall(qty = 1) {
       item_name: r.item_name,
       stock_code: r.stock_code,
       available: r.available_qty,
+      holding_wip: r.holding_qty,
       needed: r.scaled_need,
       on_order: r.on_order_qty,
       supplier_eta: r.supplier_earliest_eta,
-      gap_after_on_order: Math.max(0, r.scaled_need - r.available_qty - r.on_order_qty)
+      needs_sourcing: Math.max(0, r.scaled_need - r.available_qty - r.holding_qty - r.on_order_qty)
     }))
   };
 }
 
-// ---- Tool dispatch ----
 async function runTool(name, input) {
   if (name === 'get_rll_shortfall') {
     return get_rll_shortfall(input.qty || 1);
@@ -129,7 +134,6 @@ async function runTool(name, input) {
   return { error: `Unknown tool: ${name}` };
 }
 
-// ---- Main handler ----
 exports.handler = async function (event) {
   if (event.httpMethod !== 'POST') {
     return { statusCode: 405, body: 'Method Not Allowed' };
