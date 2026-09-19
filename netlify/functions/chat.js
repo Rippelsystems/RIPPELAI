@@ -125,7 +125,9 @@ const TOOLS = [
     name: 'get_payment_schedule',
     description: 'Upcoming unpaid supplier deliveries within N days (default '
       + '30) with net cash required (excl and incl VAT), plus overdue unpaid '
-      + 'lines. Use for cashflow planning or overdue PO follow-up.',
+      + 'lines, each with the supplier name attached. Use for cashflow '
+      + 'planning, overdue PO follow-up, or "which suppliers are late" '
+      + 'questions.',
     input_schema: { type: 'object', properties: {
       days: { type: 'integer', description: 'Days ahead to look. Defaults to 30.' }
     }}
@@ -304,7 +306,7 @@ async function get_open_po_value() {
 async function get_payment_schedule(days = 30) {
   const { data, error } = await supabase
     .from('v_payment_schedule')
-    .select('po_number, description, line_status, committed_date, qty_outstanding, '
+    .select('po_number, supplier, description, line_status, committed_date, qty_outstanding, '
           + 'unit_price, line_value, prepaid_amount, invoice_paid');
   if (error) return { error: `Query failed: ${error.message}` };
 
@@ -319,6 +321,20 @@ async function get_payment_schedule(days = 30) {
   const dueNetExcl     = Math.max(0, sum(due,'line_value') - sum(due,'prepaid_amount'));
   const overdueNetExcl = Math.max(0, sum(overdue,'line_value') - sum(overdue,'prepaid_amount'));
 
+  // Per-supplier breakdown of overdue lines — answers "which suppliers are late"
+  const overdueBySupplier = {};
+  for (const r of overdue) {
+    const name = r.supplier || 'Unknown supplier';
+    if (!overdueBySupplier[name]) {
+      overdueBySupplier[name] = { supplier: name, line_count: 0, excl_vat_zar: 0 };
+    }
+    overdueBySupplier[name].line_count++;
+    overdueBySupplier[name].excl_vat_zar += Math.max(0, (r.line_value || 0) - (r.prepaid_amount || 0));
+  }
+  const overdueSupplierList = Object.values(overdueBySupplier)
+    .map(s => ({ ...s, incl_vat_15pct_zar: s.excl_vat_zar * (1 + VAT_RATE) }))
+    .sort((a, b) => b.excl_vat_zar - a.excl_vat_zar);
+
   return {
     period_days: days,
     due_in_period: {
@@ -330,6 +346,7 @@ async function get_payment_schedule(days = 30) {
       line_count: overdue.length,
       excl_vat_zar: overdueNetExcl,
       incl_vat_15pct_zar: overdueNetExcl * (1 + VAT_RATE),
+      by_supplier: overdueSupplierList,
       note: overdue.length > 0
         ? 'Past committed delivery date, unpaid, still open — follow up with suppliers urgently'
         : 'No overdue unpaid lines'
@@ -495,7 +512,7 @@ exports.handler = async function (event) {
         },
         body: JSON.stringify({
           model:      'claude-sonnet-4-6',
-          max_tokens: 2001,
+          max_tokens: 2000,
           system:     SYSTEM_PROMPT,
           tools:      TOOLS,
           messages:   conversation
