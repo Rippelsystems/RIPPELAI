@@ -46,12 +46,29 @@ KEY PROJECT AND DEADLINE:
 - Project "2026 400 RLL": 400 RLL units must be DELIVERED by the end of
   November 2026 (30 Nov 2026). It is the first project and the template
   for the others. The tools report days remaining to that deadline.
-- For progress, shortage, priority or "will we make the date" questions
-  on this project, work from these tools together: get_rll_units_built
-  (what is already complete), get_project_progress (material coverage per
-  BOM line), get_rll_deadline_risk (what is not ordered, what is ordered
-  but late or undated, what is stuck in a process), get_open_work_orders
-  (assembly still to do). Quantities to check = 400 minus completed units.
+- FOUR DISTINCT QUESTIONS on the RLL build — keep them separate, each
+  has its own tool, never mix finished guns with sub-builds, and answer
+  ONLY the question asked:
+  1) "How many and which sub-builds are completed?" -> get_sub_builds_completed
+  2) "Which sub-builds are hampering the process?" -> get_sub_builds_hampering
+  3) "Which sub-builds should be prioritised to speed things up?" -> get_sub_build_priorities
+  4) "How many guns are assembled and have serials allocated?" ->
+     get_rll_units_built. ONLY call this tool for question 4 (or when the
+     user asks about finished guns / serial numbers). Never call it for
+     questions 1-3 or for shortages. It reports assembled guns from the
+     Production Progress position FIRST (step 1), then the Blue Card serial
+     register (step 2), which can include test builds from the tablets —
+     say so if that count is tiny.
+  Sub-builds are the BOM sub-assemblies. Questions 1-3 use the same method
+  and the same views as the Matrix Production Progress screen (sets of each
+  assembly counted recursively: built, buildable from shelf, in process,
+  on order, no cover) and the Build Sequence rules, so your numbers match
+  what the team sees on that screen.
+- For part-level shortages and "will we make the date" use
+  get_rll_deadline_risk and get_project_progress; for assembly work still
+  open use get_open_work_orders. These plan against the full 400 target;
+  sub-assemblies already on the shelf are credited automatically through
+  parent coverage. They do not use the gun register.
 - PRIORITISATION ORDER when recommending what to expedite:
   1) parts NOT ordered at all (nothing on order) — the longest lead time
      first; if the known lead time is longer than the days remaining the
@@ -160,11 +177,40 @@ const TOOLS = [
   },
   {
     name: 'get_rll_units_built',
-    description: 'How many RLL units are already built/completed, from the '
-      + 'Blue Card serial register, with the 400-unit target and the '
-      + 'remaining quantity still to build. Use FIRST for any 2026 400 RLL '
-      + 'progress question so shortages are checked against the REMAINING '
-      + 'quantity, not 400.',
+    description: 'QUESTION 4 for the RLL build: how many guns are assembled '
+      + '(from the Production Progress position) and then how many serial '
+      + 'numbers are allocated (from the Blue Card serial register, counts by '
+      + 'status, may include test builds). Call ONLY when asked about '
+      + 'finished/assembled guns or serial allocation — never for '
+      + 'sub-builds, shortages or priorities.',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'get_sub_builds_completed',
+    description: 'QUESTION 1 for the RLL build: how many sub-builds (BOM '
+      + 'sub-assemblies) are completed and which ones, measured against the '
+      + 'quantity still needed. Lists complete, partly done, in a Holding '
+      + 'Store process, and not started. Use for "how many sub builds are '
+      + 'done / which are completed". This is about SUB-ASSEMBLIES, not '
+      + 'finished guns (use get_rll_units_built for guns). Same method as the Matrix Production Progress screen.',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'get_sub_builds_hampering',
+    description: 'QUESTION 2 for the RLL build: which incomplete sub-builds '
+      + 'are being held up, and by exactly what (parts not ordered, partly '
+      + 'ordered, on order with a late or missing date, or a sub-assembly '
+      + 'that is itself short). Use for "what is hampering/blocking the '
+      + 'build process".',
+    input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'get_sub_build_priorities',
+    description: 'QUESTION 3 for the RLL build: which sub-builds to '
+      + 'prioritise to speed up the whole build, in order: unblock first '
+      + '(order now), then chase dates, then sub-builds that can be started '
+      + 'right now from stock. Use for "what is the priority to enhance/'
+      + 'expedite the process".',
     input_schema: { type: 'object', properties: {} }
   },
   {
@@ -184,9 +230,9 @@ const TOOLS = [
       + 'partially ordered parts, and parts stuck in Holding Store '
       + 'processes. Use for "what must be prioritised/expedited", "will we '
       + 'make the date" and "what processes are outstanding". qty defaults '
-      + 'to the remaining units (400 minus completed).',
+      + 'to the full project target (400).',
     input_schema: { type: 'object', properties: {
-      qty: { type: 'integer', description: 'RLL units to plan for. Defaults to remaining units to build.' }
+      qty: { type: 'integer', description: 'RLL units to plan for. Defaults to the project target (400).' }
     }}
   },
   {
@@ -391,14 +437,16 @@ function computeNeeds(allRows, qty, needCol) {
   const byId = {};
   for (const row of scaled) if (row.component_id) byId[row.component_id] = row;
   const out = [];
-  for (const row of scaled) {
+  for (let i = 0; i < scaled.length; i++) {
+    const row = scaled[i];
+    const orig = allRows[i];
     if (row.build_status === 'CONTAINER') continue;
     const parent = row.dependant_code ? byId[row.dependant_code] : null;
     let need;
     if (!parent) need = row.scaled_need;
     else if (parent.available_qty >= parent.scaled_need) need = 0;
     else need = Math.max(0, parent.scaled_need - parent.available_qty) * row.req_per_unit;
-    out.push({ row, need });
+    out.push({ row, orig, need });
   }
   return out;
 }
@@ -460,14 +508,15 @@ async function get_grn40_shortfall(qty = 1) {
 
 // ── 2026 400 RLL project tools ──────────────────────────────────────────────
 
-async function get_rll_units_built() {
-  const { data: proj } = await supabase
-    .from('projects').select('project_name, target_qty, status, end_date')
-    .eq('project_name', PROJECT_400).limit(1);
+async function readBlueCardRegister() {
+  const [projRes, serRes] = await Promise.all([
+    supabase.from('projects').select('project_name, target_qty, status, end_date')
+      .eq('project_name', PROJECT_400).limit(1),
+    supabase.from('weapon_serials').select('*').eq('card_type', 'RLL').limit(5000)
+  ]);
+  const proj = projRes.data;
   const target = proj && proj[0] ? num(proj[0].target_qty) : 0;
-
-  const { data, error } = await supabase
-    .from('weapon_serials').select('*').eq('card_type', 'RLL').limit(5000);
+  const { data, error } = serRes;
   if (error) {
     return { target_qty: target || null, error: `Could not read the serial register: ${error.message}` };
   }
@@ -509,19 +558,358 @@ async function get_rll_units_built() {
     completed_units: completed,
     in_progress_units: inProgress,
     unbuilt_units: unbuilt,
+    serials_allocated_or_in_use: completed + inProgress,
     remaining_to_build: target ? Math.max(0, target - completed) : null,
     days_to_deadline: daysUntil(DEADLINE_400),
     deadline: DEADLINE_400,
-    note: 'completed_units counts statuses that look like COMPLETE/RELEASED/SHIPPED/DELIVERED/DONE/PASSED. Check counts_by_status if the labels differ. This is the serial register for card type RLL (one contract: 400 units).'
+    note: 'This is the Blue Card gun register — it can include test builds still being run on the tablets (they show as in progress). It is NOT sub-builds. completed_units counts statuses that look like COMPLETE/RELEASED/SHIPPED/DELIVERED/DONE/PASSED. Check counts_by_status if the labels differ. This is the serial register for card type RLL (one contract: 400 units).'
+  };
+}
+
+
+// Target quantity for the 400 RLL project (does NOT touch the Blue Card register)
+function targetFromProject(projRes) {
+  const t = projRes && projRes.data && projRes.data[0] ? num(projRes.data[0].target_qty) : 0;
+  return t > 0 ? t : 400;
+}
+
+// ── Production Progress model (mirrors the Matrix Production Progress screen) ─
+// Reads v_rll_build_progress + v_rll_build_effective (per project) and the
+// Build Sequence rules in build_dependencies, and counts complete SETS of
+// every assembly recursively, exactly as frm_production_progress.py does.
+
+async function loadProgressModel() {
+  const byProject = q => q.eq('project_name', PROJECT_400);
+  const [projRes, prog, eff, deps] = await Promise.all([
+    supabase.from('projects').select('project_name, target_qty, start_date, end_date')
+      .eq('project_name', PROJECT_400).limit(1),
+    fetchAll('v_rll_build_progress', '*', { mod: byProject }),
+    fetchAll('v_rll_build_effective', '*', { mod: byProject }),
+    fetchAll('build_dependencies', '*', { order: 'sequence_no' })
+  ]);
+  if (prog.error) return { error: prog.error };
+  if (eff.error)  return { error: eff.error };
+  if (prog.data.length === 0) return { error: `v_rll_build_progress has no rows for project "${PROJECT_400}".` };
+
+  const target = targetFromProject(projRes);
+  const rows = prog.data;
+  const effRows = eff.data;
+  const depRows = deps.error ? [] : deps.data;
+
+  const byId = {}, children = {}, effById = {};
+  for (const r of rows) {
+    if (r.component_id) byId[r.component_id] = r;
+    if (r.dependant_code) (children[r.dependant_code] = children[r.dependant_code] || []).push(r);
+  }
+  for (const e of effRows) if (e.component_id) effById[e.component_id] = e;
+
+  const cache = new Map();
+  const qtyFor = (row, mode) => {
+    let q = num(row.available_qty);
+    if (mode === 'wip' || mode === 'order') q += num(row.holding_qty) + num(row.in_process_qty);
+    if (mode === 'order') q += num(row.on_order_qty);
+    return Math.max(q, 0);
+  };
+  function capacity(row, mode, seen) {
+    const cid = row.component_id;
+    const key = cid ? cid + '|' + mode : null;
+    if (key && cache.has(key)) return cache.get(key);
+    const sn = new Set(seen || []);
+    if (cid) { if (sn.has(cid)) return 0; sn.add(cid); }
+    let own = qtyFor(row, mode);
+    const kids = cid ? (children[cid] || []) : [];
+    if (kids.length) {
+      let fromKids = null;
+      for (const k of kids) {
+        const req = num(k.req_per_unit) || 1;
+        const sets = Math.floor(capacity(k, mode, sn) / req);
+        fromKids = fromKids === null ? sets : Math.min(fromKids, sets);
+      }
+      own += Math.max(fromKids || 0, 0);
+    }
+    if (key) cache.set(key, own);
+    return own;
+  }
+  const hasChildren = r => !!(r.component_id && (children[r.component_id] || []).length);
+  const isAssembly  = r => hasChildren(r) || !!r.is_assembly_group || r.build_status === 'CONTAINER';
+
+  const roots = rows.filter(r => !r.dependant_code);
+  const root = rows.find(r => r.component_id === 'RLLMB1')
+    || roots.slice().sort((a, b) => ((children[b.component_id] || []).length) - ((children[a.component_id] || []).length))[0]
+    || null;
+
+  function bands(row, need) {
+    if (need <= 0) return { built: 0, buildable: 0, wip: 0, onOrder: 0, gap: 0 };
+    const built = Math.min(Math.max(num(row.available_qty), 0), need);
+    const ready = Math.min(capacity(row, 'ready'), need);
+    const wip   = Math.min(capacity(row, 'wip'), need);
+    const order = Math.min(capacity(row, 'order'), need);
+    return { built, buildable: Math.max(ready - built, 0), wip: Math.max(wip - ready, 0),
+             onOrder: Math.max(order - wip, 0), gap: Math.max(need - order, 0) };
+  }
+
+  // Assemblies waiting behind a node: the node itself, then everything the
+  // Build Sequence rules put behind it, in order.
+  const waiters = {};
+  for (const d of depRows) {
+    const p = d.depends_on_component_id, c = d.component_id;
+    if (p && c) (waiters[p] = waiters[p] || []).push(c);
+  }
+  function heldUpBy(row) {
+    const cid = row.component_id, pcode = row.dependant_code;
+    let start = null;
+    if (pcode && byId[pcode]) start = pcode;
+    else if (cid && isAssembly(row)) start = cid;
+    if (!start) return [];
+    const names = [], seen = new Set([start]), queue = [start];
+    while (queue.length) {
+      const node = queue.shift();
+      for (const nxt of (waiters[node] || [])) {
+        if (seen.has(nxt)) continue;
+        seen.add(nxt); queue.push(nxt);
+        if (byId[nxt]) names.push(byId[nxt].item_name || nxt);
+      }
+    }
+    const first = byId[start];
+    return [first ? first.item_name : null, ...names].filter(Boolean);
+  }
+
+  // Direct real children, looking through CONTAINER grouping rows
+  function realKids(row, depth = 0) {
+    const out = [];
+    for (const k of (children[row.component_id] || [])) {
+      if (k.build_status === 'CONTAINER' && depth < 6) out.push(...realKids(k, depth + 1));
+      else out.push(k);
+    }
+    return out;
+  }
+
+  return { target, rows, effRows, depRows, depsError: deps.error || null, byId, children, effById,
+           capacity, bands, isAssembly, hasChildren, root, heldUpBy, realKids, project: projRes.data && projRes.data[0] };
+}
+
+const SUB_STATE_RANK = { 'NOT ORDERED': 1, 'PARTLY ORDERED': 2, 'ON ORDER - ETA PASSED': 3, 'ON ORDER - NO DATE': 3,
+  'ON ORDER - ETA AFTER DEADLINE': 4, 'SUB-ASSEMBLY ITSELF SHORT': 5, 'ON ORDER': 6 };
+
+function assemblyList(m) {
+  const out = [];
+  for (const a of m.rows) {
+    if (!m.isAssembly(a) || a.build_status === 'CONTAINER' || a === m.root) continue;
+    const need = num(a.need_total) || m.target;
+    const b = m.bands(a, need);
+    const parent = a.dependant_code ? m.byId[a.dependant_code] : null;
+    const rec = {
+      item_name: a.item_name, stock_code: a.stock_code,
+      feeds: parent && parent !== m.root ? parent.item_name : 'final RLL',
+      needed: need, built: b.built, buildable_now_from_stock: b.buildable,
+      in_holding_or_service_process: b.wip, on_order_sets: b.onOrder, no_cover_anywhere: b.gap,
+      pct_built: Math.round(Math.min(100, b.built / need * 100)),
+    };
+    rec.state = b.built >= need ? 'COMPLETE' : (b.built > 0 ? 'PARTLY BUILT' : 'NOT STARTED');
+    rec._row = a; rec._need = need;
+    out.push(rec);
+  }
+  return out;
+}
+
+function blockersFor(m, rec) {
+  const blockers = [], processes = [];
+  const a = rec._row;
+  for (const c of m.realKids(a)) {
+    const e = m.effById[c.component_id] || {};
+    const cneed = num(e.effective_need !== undefined ? e.effective_need : c.need_total);
+    if (cneed <= 0) continue;
+    const avail = num(c.available_qty);
+    const proc  = num(c.holding_qty) + num(c.in_process_qty);
+    const oo    = num(c.on_order_qty);
+    const short = Math.max(0, cneed - avail);
+    if (short === 0) continue;
+    const eta = (e.supplier_latest_eta || c.supplier_latest_eta || c.supplier_earliest_eta)
+      ? String(e.supplier_latest_eta || c.supplier_latest_eta || c.supplier_earliest_eta).slice(0, 10) : null;
+    const base = { item_name: c.item_name, stock_code: c.stock_code, short_on_shelf: short,
+                   in_process: proc, on_order: oo, supplier_eta: eta };
+
+    if (m.hasChildren(c)) {
+      const cb = m.bands(c, num(c.need_total) || cneed);
+      if (cb.built < (num(c.need_total) || cneed) && (m.capacity(c, 'order') < (num(c.need_total) || cneed))) {
+        blockers.push({ ...base, kind: 'sub-assembly', state: 'SUB-ASSEMBLY ITSELF SHORT', sets_with_no_cover: cb.gap });
+      }
+      continue;
+    }
+    const afterProc = Math.max(0, short - proc);
+    if (afterProc === 0) { processes.push({ item_name: c.item_name, stock_code: c.stock_code, in_process: proc }); continue; }
+    const needsSourcing = num(e.needs_sourcing);
+    let st;
+    if (needsSourcing > 0) st = oo > 0 ? 'PARTLY ORDERED' : 'NOT ORDERED';
+    else if (e.eta_overdue === true) st = 'ON ORDER - ETA PASSED';
+    else if (!eta) st = 'ON ORDER - NO DATE';
+    else if (eta > DEADLINE_400) st = 'ON ORDER - ETA AFTER DEADLINE';
+    else st = 'ON ORDER';
+    blockers.push({ ...base, kind: 'part', needs_sourcing: needsSourcing || undefined, state: st });
+  }
+  return { blockers, processes };
+}
+
+function feedersBehind(m, rec) {
+  const out = [];
+  for (const d of m.depRows) {
+    if (d.component_id !== rec._row.component_id) continue;
+    const fr = m.byId[d.depends_on_component_id];
+    if (!fr) continue;
+    const fneed = num(fr.need_total) || m.target;
+    const pct = Math.round(Math.min(100, Math.max(num(fr.available_qty), 0) / fneed * 100));
+    if (pct < 100) out.push({ feeder: fr.item_name, pct_built: pct, sequence_no: d.sequence_no });
+  }
+  return out.sort((x, y) => x.pct_built - y.pct_built);
+}
+
+function screenSummary(m) {
+  const real = m.rows.filter(r => r.build_status !== 'CONTAINER');
+  const asm  = m.rows.filter(r => m.isAssembly(r));
+  const built   = m.root ? Math.min(Math.max(num(m.root.available_qty), 0), m.target) : 0;
+  const canMake = m.root ? Math.min(m.capacity(m.root, 'ready'), m.target) : 0;
+  const secured = m.root ? Math.min(m.capacity(m.root, 'order'), m.target) : 0;
+  const sourcing = m.effRows.filter(r => r.build_status !== 'CONTAINER' && num(r.needs_sourcing) > 0).length;
+  let asmPct = null;
+  if (asm.length && m.target > 0) {
+    const done = asm.reduce((s, r) => s + Math.min(Math.max(num(r.available_qty), 0), m.target), 0);
+    asmPct = Math.round(done / (asm.length * m.target) * 100);
+  }
+  let limiting = null;
+  if (real.length) limiting = real.reduce((lo, r) => num(r.pct_ready) < num(lo.pct_ready) ? r : lo, real[0]);
+  return {
+    guns_assembled_in_stock: built, buildable_now_from_shelf_stock: canMake,
+    secured_incl_process_and_on_order: secured, target: m.target,
+    assembly_completion_pct: asmPct, lines_needing_sourcing: sourcing,
+    gating_line: limiting ? { item_name: limiting.item_name, stock_code: limiting.stock_code,
+      in_store: num(limiting.available_qty), needed: num(limiting.need_total),
+      holds_up: m.heldUpBy(limiting).slice(0, 6) } : null
+  };
+}
+
+const MODEL_NOTE = 'Same method as the Matrix Production Progress screen: sets of each assembly are counted recursively from shelf stock, then Holding Store and service-order processes, then open POs. Build time per sub-build is not in the system. Containers (grouping rows) are looked through, not listed.';
+
+function sequenceNote(m) {
+  return m.depsError
+    ? { build_sequence_rules: 'could not be read: ' + m.depsError }
+    : (m.depRows.length === 0
+        ? { build_sequence_rules: 'none returned — either none are set up or the bot has no read access to build_dependencies (RLS returns zero rows silently), so downstream "holds up" lists are empty' }
+        : { build_sequence_rules: m.depRows.length });
+}
+
+async function get_sub_builds_completed() {
+  const m = await loadProgressModel();
+  if (m.error) return m;
+  const all = assemblyList(m);
+  const slim = x => ({ item_name: x.item_name, stock_code: x.stock_code, feeds: x.feeds, needed: x.needed,
+    built: x.built, pct_built: x.pct_built, can_still_build_from_shelf: x.buildable_now_from_stock || undefined,
+    in_process: x.in_holding_or_service_process || undefined, on_order_sets: x.on_order_sets || undefined });
+  const complete = all.filter(x => x.state === 'COMPLETE');
+  const partial  = all.filter(x => x.state === 'PARTLY BUILT').sort((x, y) => y.pct_built - x.pct_built);
+  const notStarted = all.filter(x => x.state === 'NOT STARTED');
+  return {
+    project: PROJECT_400, target: m.target, deadline: DEADLINE_400, days_remaining: daysUntil(DEADLINE_400),
+    sub_assemblies: all.length, completed: complete.length, partly_built: partial.length, not_started: notStarted.length,
+    completed_list: complete.map(slim),
+    partly_built_list: partial.slice(0, 40).map(slim),
+    not_started_list: notStarted.slice(0, 40).map(slim),
+    guns_view: screenSummary(m),
+    ...sequenceNote(m),
+    note: 'COMPLETE = the assembly\'s own stock on the shelf (after WO/service-order commitments) covers the quantity needed. ' + MODEL_NOTE
+  };
+}
+
+async function get_sub_builds_hampering() {
+  const m = await loadProgressModel();
+  if (m.error) return m;
+  const hampered = [];
+  for (const rec of assemblyList(m)) {
+    if (rec.state === 'COMPLETE') continue;
+    const { blockers, processes } = blockersFor(m, rec);
+    if (blockers.length === 0 && rec.no_cover_anywhere === 0) continue;
+    hampered.push({ rec, blockers, processes });
+  }
+  hampered.sort((x, y) => (y.rec.needed - y.rec.built) - (x.rec.needed - x.rec.built));
+  const byState = {};
+  for (const h of hampered) for (const b of h.blockers) byState[b.state] = (byState[b.state] || 0) + 1;
+  return {
+    project: PROJECT_400, target: m.target, deadline: DEADLINE_400, days_remaining: daysUntil(DEADLINE_400),
+    hampered_sub_builds: hampered.length,
+    blocking_items_by_type: byState,
+    sub_builds: hampered.slice(0, 30).map(h => ({
+      item_name: h.rec.item_name, stock_code: h.rec.stock_code, feeds: h.rec.feeds,
+      built: h.rec.built, needed: h.rec.needed, pct_built: h.rec.pct_built,
+      sets_with_no_cover_anywhere: h.rec.no_cover_anywhere,
+      blocked_by: h.blockers.slice().sort((p, q) => (SUB_STATE_RANK[p.state] || 9) - (SUB_STATE_RANK[q.state] || 9)).slice(0, 8),
+      also_waiting_on_process: h.processes.length ? h.processes.slice(0, 5) : undefined,
+      feeder_assemblies_still_behind: feedersBehind(m, h.rec).slice(0, 4)
+    })),
+    ...sequenceNote(m),
+    note: 'Parts that only need a Holding Store or service-order process to finish are listed as waiting_on_process (chase the process, not a PO). feeder_assemblies_still_behind comes from the Build Sequence rules — information for chasing, never a block. ' + MODEL_NOTE
+  };
+}
+
+async function get_sub_build_priorities() {
+  const m = await loadProgressModel();
+  if (m.error) return m;
+  const items = [];
+  for (const rec of assemblyList(m)) {
+    if (rec.state === 'COMPLETE') continue;
+    const { blockers, processes } = blockersFor(m, rec);
+    const held = m.heldUpBy(rec._row);
+    items.push({ rec, blockers, processes, holdsUp: held.filter(n => n !== rec.item_name),
+      worst: blockers.length ? Math.min(...blockers.map(b => SUB_STATE_RANK[b.state] || 9)) : 99,
+      toMake: rec._need - rec.built });
+  }
+  const order = (x, y) => x.worst - y.worst || y.holdsUp.length - x.holdsUp.length || y.toMake - x.toMake;
+  const unblock = items.filter(x => x.worst <= 2).sort(order);
+  const chase   = items.filter(x => x.worst >= 3 && x.worst <= 5).sort(order);
+  const waiting = items.filter(x => x.worst === 6).sort(order);
+  const startNow = items.filter(x => x.blockers.length === 0 && x.rec.buildable_now_from_stock > 0)
+    .sort((x, y) => y.holdsUp.length - x.holdsUp.length || y.rec.buildable_now_from_stock - x.rec.buildable_now_from_stock);
+  const processOnly = items.filter(x => x.blockers.length === 0 && x.rec.buildable_now_from_stock === 0 && x.processes.length > 0);
+
+  const fmt = x => ({ item_name: x.rec.item_name, stock_code: x.rec.stock_code, feeds: x.rec.feeds,
+    built: x.rec.built, needed: x.rec.needed, pct_built: x.rec.pct_built,
+    holds_up: x.holdsUp.length ? x.holdsUp.slice(0, 5) : undefined,
+    blocked_by: x.blockers.slice().sort((p, q) => (SUB_STATE_RANK[p.state] || 9) - (SUB_STATE_RANK[q.state] || 9)).slice(0, 5),
+    waiting_on_process: x.processes.length ? x.processes.slice(0, 3) : undefined });
+
+  return {
+    project: PROJECT_400, target: m.target, deadline: DEADLINE_400, days_remaining: daysUntil(DEADLINE_400),
+    gating_view: screenSummary(m),
+    priority_1_unblock_now_parts_not_or_partly_ordered: { count: unblock.length, sub_builds: unblock.slice(0, 20).map(fmt) },
+    priority_2_chase_supplier_dates_or_short_sub_assemblies: { count: chase.length, sub_builds: chase.slice(0, 20).map(fmt) },
+    priority_3_on_order_within_date: { count: waiting.length, sub_builds: waiting.slice(0, 15).map(fmt) },
+    priority_4_start_now_all_parts_in_stock: { count: startNow.length,
+      sub_builds: startNow.slice(0, 25).map(x => ({ ...fmt(x), can_build_now_sets: x.rec.buildable_now_from_stock })) },
+    chase_the_process_only: { count: processOnly.length, sub_builds: processOnly.slice(0, 15).map(fmt) },
+    ...sequenceNote(m),
+    method: 'Ranked: (1) any part not ordered or partly ordered, (2) late/undated deliveries or a short sub-assembly, (3) deliveries on order within date, (4) sub-builds with every part in stock — start these now to use floor time. Within a tier, sub-builds that hold up the most other assemblies (per the Build Sequence rules and BOM parent) come first, then larger quantities still to make.',
+    note: 'Build time per sub-build is not in the system, so ranking cannot weigh how long each takes. A missing lead time or date is never estimated. ' + MODEL_NOTE
+  };
+}
+
+// QUESTION 4: guns assembled (from Production Progress / stock), THEN the
+// Blue Card serial register for allocation — never the other way round.
+async function get_rll_units_built() {
+  const m = await loadProgressModel();
+  const stockView = m.error ? { error: m.error } : screenSummary(m);
+  const register = await readBlueCardRegister();
+  return {
+    step_1_assembled_per_production_progress: stockView,
+    step_2_serials_per_blue_card_register: register,
+    note: 'Step 1 is the finished-gun stock position on the Production Progress screen (the root assembly\'s own stock). Step 2 is the Blue Card serial register — counts by status; test builds on the tablets show as in progress, so a tiny count there may be test data.'
   };
 }
 
 async function get_project_progress() {
-  const { data: proj } = await supabase
-    .from('projects').select('project_name, target_qty, status, start_date, end_date, manager')
-    .eq('project_name', PROJECT_400).limit(1);
-
-  const prog = await fetchAll('v_rll_build_progress', '*');
+  const [projRes, prog] = await Promise.all([
+    supabase.from('projects').select('project_name, target_qty, status, start_date, end_date, manager')
+      .eq('project_name', PROJECT_400).limit(1),
+    fetchAll('v_rll_build_progress', '*', { mod: q => q.eq('project_name', PROJECT_400) })
+  ]);
+  const proj = projRes.data;
   if (prog.error) return { error: prog.error };
   const rows = prog.data;
   if (rows.length === 0) return { error: 'v_rll_build_progress returned no rows.' };
@@ -574,27 +962,21 @@ async function get_project_progress() {
 }
 
 async function get_rll_deadline_risk(qtyArg) {
-  const built = await get_rll_units_built();
-  let qty = qtyArg;
-  let qtyBasis = 'qty supplied by caller';
-  if (!qty) {
-    if (built && built.remaining_to_build != null) {
-      qty = built.remaining_to_build;
-      qtyBasis = `remaining = target ${built.target_qty} minus ${built.completed_units} completed`;
-    } else {
-      qty = (built && built.target_qty) || 400;
-      qtyBasis = 'completed-unit count unavailable, so the full target was used — shortages may be overstated';
-    }
-  }
+  const [projRes, readiness, crossStoreMap, lt] = await Promise.all([
+    supabase.from('projects').select('target_qty').eq('project_name', PROJECT_400).limit(1),
+    supabase.from('v_rll_build_readiness').select(RLL_READINESS_COLS),
+    getCrossStoreMap(),
+    supabase.from('part_lead_times').select('stock_code, item_name, supplier, lead_days').limit(5000)
+  ]);
+  const qty = qtyArg || targetFromProject(projRes);
+  const qtyBasis = qtyArg
+    ? 'qty supplied by caller'
+    : `full project target of ${qty}; the Blue Card gun register is not used. If finished guns have already left stock, shortages for those units may be overstated.`;
 
-  const { data: allRows, error } = await supabase
-    .from('v_rll_build_readiness').select(RLL_READINESS_COLS);
-  if (error) return { error: `Query failed: ${error.message}` };
+  if (readiness.error) return { error: `Query failed: ${readiness.error.message}` };
+  const allRows = readiness.data;
 
-  const crossStoreMap = await getCrossStoreMap();
-
-  const { data: ltData } = await supabase
-    .from('part_lead_times').select('stock_code, item_name, supplier, lead_days').limit(5000);
+  const ltData = lt.data;
   const leadMap = {};
   for (const l of (ltData || [])) if (l.stock_code) leadMap[l.stock_code] = l;
 
@@ -652,7 +1034,6 @@ async function get_rll_deadline_risk(qtyArg) {
     days_remaining: daysLeft,
     quantity_planned_for: qty,
     quantity_basis: qtyBasis,
-    units_completed: built && built.completed_units != null ? built.completed_units : null,
     summary: {
       not_ordered_parts: notOrdered.length,
       partly_ordered_parts: partlyOrdered.length,
@@ -1236,6 +1617,9 @@ async function runTool(name, input) {
     if (name === 'get_rll_shortfall')             return await get_rll_shortfall(input.qty || 1);
     if (name === 'get_grn40_shortfall')           return await get_grn40_shortfall(input.qty || 1);
     if (name === 'get_rll_units_built')           return await get_rll_units_built();
+    if (name === 'get_sub_builds_completed')      return await get_sub_builds_completed();
+    if (name === 'get_sub_builds_hampering')      return await get_sub_builds_hampering();
+    if (name === 'get_sub_build_priorities')      return await get_sub_build_priorities();
     if (name === 'get_project_progress')          return await get_project_progress();
     if (name === 'get_rll_deadline_risk')         return await get_rll_deadline_risk(input.qty);
     if (name === 'get_open_work_orders')          return await get_open_work_orders(input.project_name);
@@ -1290,13 +1674,13 @@ exports.handler = async function (event) {
 
       if (data.stop_reason === 'tool_use') {
         conversation.push({ role: 'assistant', content: data.content });
-        const results = [];
-        for (const block of data.content.filter(b => b.type === 'tool_use')) {
-          results.push({
+        // Run all requested tools at the same time (Netlify times out at ~10-26s)
+        const results = await Promise.all(
+          data.content.filter(b => b.type === 'tool_use').map(async block => ({
             type: 'tool_result', tool_use_id: block.id,
             content: JSON.stringify(await runTool(block.name, block.input))
-          });
-        }
+          }))
+        );
         conversation.push({ role: 'user', content: results });
         continue;
       }
