@@ -694,14 +694,17 @@ const SUB_STATE_RANK = { 'NOT ORDERED': 1, 'PARTLY ORDERED': 2, 'ON ORDER - ETA 
 function assemblyList(m) {
   const out = [];
   for (const a of m.rows) {
-    if (!m.isAssembly(a) || a.build_status === 'CONTAINER' || a === m.root) continue;
-    const need = num(a.need_total) || m.target;
+    // The Production Progress screen treats CONTAINER rows as assemblies
+    // (they carry the assembled stock), so they are included here.
+    if (!m.isAssembly(a) || a === m.root) continue;
+    const need = m.target;               // the screen scores every node against the project target
     const b = m.bands(a, need);
     const parent = a.dependant_code ? m.byId[a.dependant_code] : null;
     const rec = {
       item_name: a.item_name, stock_code: a.stock_code,
       feeds: parent && parent !== m.root ? parent.item_name : 'final RLL',
-      needed: need, built: b.built, buildable_now_from_stock: b.buildable,
+      needed: need, built: b.built, in_stock: num(a.available_qty),
+      buildable_now_from_stock: b.buildable,
       in_holding_or_service_process: b.wip, on_order_sets: b.onOrder, no_cover_anywhere: b.gap,
       pct_built: Math.round(Math.min(100, b.built / need * 100)),
     };
@@ -715,9 +718,10 @@ function assemblyList(m) {
 function blockersFor(m, rec) {
   const blockers = [], processes = [];
   const a = rec._row;
-  for (const c of m.realKids(a)) {
+  for (const c of (m.children[a.component_id] || [])) {
     const e = m.effById[c.component_id] || {};
-    const cneed = num(e.effective_need !== undefined ? e.effective_need : c.need_total);
+    const isAsm = m.isAssembly(c);
+    const cneed = isAsm ? m.target : num(e.effective_need !== undefined ? e.effective_need : c.need_total);
     if (cneed <= 0) continue;
     const avail = num(c.available_qty);
     const proc  = num(c.holding_qty) + num(c.in_process_qty);
@@ -729,10 +733,11 @@ function blockersFor(m, rec) {
     const base = { item_name: c.item_name, stock_code: c.stock_code, short_on_shelf: short,
                    in_process: proc, on_order: oo, supplier_eta: eta };
 
-    if (m.hasChildren(c)) {
-      const cb = m.bands(c, num(c.need_total) || cneed);
-      if (cb.built < (num(c.need_total) || cneed) && (m.capacity(c, 'order') < (num(c.need_total) || cneed))) {
-        blockers.push({ ...base, kind: 'sub-assembly', state: 'SUB-ASSEMBLY ITSELF SHORT', sets_with_no_cover: cb.gap });
+    if (isAsm) {
+      const cb = m.bands(c, m.target);
+      if (cb.built < m.target) {
+        blockers.push({ ...base, kind: 'sub-assembly', state: 'SUB-ASSEMBLY ITSELF SHORT',
+          built: cb.built, can_still_build_from_shelf: cb.buildable, sets_with_no_cover: cb.gap });
       }
       continue;
     }
@@ -787,7 +792,7 @@ function screenSummary(m) {
   };
 }
 
-const MODEL_NOTE = 'Same method as the Matrix Production Progress screen: sets of each assembly are counted recursively from shelf stock, then Holding Store and service-order processes, then open POs. Build time per sub-build is not in the system. Containers (grouping rows) are looked through, not listed.';
+const MODEL_NOTE = 'Same method as the Matrix Production Progress screen: sets of each assembly are counted recursively from shelf stock, then Holding Store and service-order processes, then open POs. Build time per sub-build is not in the system. Rows the BOM marks as CONTAINER are counted as assemblies, as on the screen.';
 
 function sequenceNote(m) {
   return m.depsError
@@ -802,7 +807,7 @@ async function get_sub_builds_completed() {
   if (m.error) return m;
   const all = assemblyList(m);
   const slim = x => ({ item_name: x.item_name, stock_code: x.stock_code, feeds: x.feeds, needed: x.needed,
-    built: x.built, pct_built: x.pct_built, can_still_build_from_shelf: x.buildable_now_from_stock || undefined,
+    in_stock: x.in_stock, built: x.built, pct_built: x.pct_built, can_still_build_from_shelf: x.buildable_now_from_stock || undefined,
     in_process: x.in_holding_or_service_process || undefined, on_order_sets: x.on_order_sets || undefined });
   const complete = all.filter(x => x.state === 'COMPLETE');
   const partial  = all.filter(x => x.state === 'PARTLY BUILT').sort((x, y) => y.pct_built - x.pct_built);
