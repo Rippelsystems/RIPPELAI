@@ -136,6 +136,26 @@
   .bubble th { background: #f4f6f9; }
   .loading { opacity: 0.55; font-style: italic; }
 
+  /* ---- Share actions under each answer ---- */
+  .actions { display: flex; gap: 8px; margin-top: 8px; }
+  .act-btn {
+    background: white;
+    border: 1px solid #d9dee8;
+    color: #2a3142;
+    padding: 5px 12px;
+    border-radius: 8px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .act-btn:hover { background: #eef1f7; border-color: #2b5fb8; }
+  #toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: #12213f; color: white; padding: 10px 18px; border-radius: 10px;
+    font-size: 13px; opacity: 0; pointer-events: none; transition: opacity 0.25s;
+    max-width: 90vw; text-align: center; z-index: 10;
+  }
+  #toast.show { opacity: 1; }
+
   form {
     display: flex;
     flex-direction: column;
@@ -233,6 +253,7 @@
   </header>
 
   <div id="chat"></div>
+  <div id="toast"></div>
 
   <form id="chatForm">
     <div class="input-row">
@@ -298,6 +319,102 @@
     return bubble;
   }
 
+  // ---- Share an answer: email (pre-filled) or copy ----
+  function showToast(msg) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    clearTimeout(showToast._t);
+    showToast._t = setTimeout(() => t.classList.remove('show'), 4500);
+  }
+
+  // Markdown from the assistant -> readable plain text for an email body
+  function toPlain(text) {
+    return text
+      .split('\n')
+      .filter(l => !/^\s*\|[\s\-:|]+\|\s*$/.test(l))              // table divider rows
+      .map(l => l.trim().startsWith('|')
+        ? l.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim()).join('  |  ')
+        : l)
+      .join('\n')
+      .replace(/^#{1,4}\s*/gm, '')
+      .replace(/\*\*(.*?)\*\*/g, '$1')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  function stamp() {
+    return new Date().toLocaleString('en-ZA', { dateStyle: 'medium', timeStyle: 'short' });
+  }
+
+  function buildShareText(question, answer) {
+    return 'Question:\n' + question + '\n\nAnswer (' + stamp() + '):\n' + toPlain(answer) +
+           '\n\n--\nFrom the Rippel Matrix AI assistant. Read-only view of LIVE data at the time shown.';
+  }
+
+  async function copyText(plain, html) {
+    try {
+      if (html && window.ClipboardItem && navigator.clipboard && navigator.clipboard.write) {
+        await navigator.clipboard.write([new ClipboardItem({
+          'text/html':  new Blob([html],  { type: 'text/html' }),
+          'text/plain': new Blob([plain], { type: 'text/plain' })
+        })]);
+        return true;
+      }
+      await navigator.clipboard.writeText(plain);
+      return true;
+    } catch (e) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = plain; document.body.appendChild(ta); ta.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        return ok;
+      } catch (e2) { return false; }
+    }
+  }
+
+  async function copyAnswer(question, answer) {
+    const html = '<p><strong>Question:</strong> ' +
+      question.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') +
+      '</p><p><strong>Answer (' + stamp() + '):</strong></p>' + renderMarkdown(answer).replace(/\n/g, '<br>');
+    const ok = await copyText(buildShareText(question, answer), html);
+    showToast(ok ? 'Copied — paste into your email.' : 'Could not copy automatically. Select the answer and copy it.');
+  }
+
+  async function emailAnswer(question, answer) {
+    const full = buildShareText(question, answer);
+    const subject = 'Rippel Matrix AI: ' + (question.length > 90 ? question.slice(0, 87) + '...' : question);
+    // Email links are limited to roughly 2000 characters. Shorten the body to fit,
+    // and put the FULL text on the clipboard so nothing is lost.
+    const MAX = 1800;
+    let body = full;
+    let shortened = false;
+    while (encodeURIComponent(subject + body).length > MAX && body.length > 200) {
+      body = body.slice(0, Math.floor(body.length * 0.9));
+      shortened = true;
+    }
+    if (shortened) body += '\n\n[Shortened — paste the full answer here from the clipboard]';
+    await copyText(full, null);
+    window.location.href = 'mailto:?subject=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(body);
+    showToast(shortened
+      ? 'Email opened. The answer was long, so the FULL text is on your clipboard — paste it into the email.'
+      : 'Email opened. (The full text is also on your clipboard.)');
+  }
+
+  function addActions(row, question, answer) {
+    const bar = document.createElement('div');
+    bar.className = 'actions';
+    const mail = document.createElement('button');
+    mail.type = 'button'; mail.className = 'act-btn'; mail.textContent = '✉ Email this';
+    mail.onclick = () => emailAnswer(question, answer);
+    const copy = document.createElement('button');
+    copy.type = 'button'; copy.className = 'act-btn'; copy.textContent = '⧉ Copy';
+    copy.onclick = () => copyAnswer(question, answer);
+    bar.appendChild(mail); bar.appendChild(copy);
+    row.appendChild(bar);
+  }
+
   function quickAsk(text) {
     input.value = text;
     form.dispatchEvent(new Event('submit'));
@@ -333,6 +450,7 @@
 
       loadingBubble.innerHTML = renderMarkdown(replyText);
       loadingBubble.classList.remove('loading');
+      if (textBlock) addActions(loadingBubble.parentElement, text, replyText);
 
       messages.push({ role: 'assistant', content: data.content });
 
