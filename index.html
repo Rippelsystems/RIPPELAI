@@ -280,7 +280,7 @@
     html = html.replace(/((?:\|.*\|\r?\n?)+)/g, (block) => {
       const lines = block.trim().split('\n').filter(l => l.trim().startsWith('|'));
       if (lines.length < 2) return block;
-      const rows = lines.filter(l => !/^\|[\s\-|]+\|$/.test(l.trim()));
+      const rows = lines.filter(l => !/^\|[\s\-:|]+\|$/.test(l.trim()));
       if (rows.length < 1) return block;
       const cells = rows.map(r => r.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim()));
       let out = '<table>';
@@ -374,10 +374,18 @@
     }
   }
 
+  // Outlook drops the page stylesheet, so write the table borders into the HTML itself
+  function styleTablesInline(html) {
+    return html
+      .replace(/<table>/g, '<table style="border-collapse:collapse;margin:8px 0;font-size:13px;">')
+      .replace(/<th>/g, '<th style="border:1px solid #bbbbbb;background:#eef1f7;padding:5px 9px;text-align:left;">')
+      .replace(/<td>/g, '<td style="border:1px solid #bbbbbb;padding:5px 9px;text-align:left;">');
+  }
+
   async function copyAnswer(question, answer) {
     const html = '<p><strong>Question:</strong> ' +
       question.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') +
-      '</p><p><strong>Answer (' + stamp() + '):</strong></p>' + renderMarkdown(answer).replace(/\n/g, '<br>');
+      '</p><p><strong>Answer (' + stamp() + '):</strong></p>' + styleTablesInline(renderMarkdown(answer)).replace(/\n/g, '<br>');
     const ok = await copyText(buildShareText(question, answer), html);
     showToast(ok ? 'Copied — paste into your email.' : 'Could not copy automatically. Select the answer and copy it.');
   }
