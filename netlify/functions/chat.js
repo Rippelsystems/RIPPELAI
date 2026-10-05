@@ -164,7 +164,17 @@ ANSWER LENGTH (important — long answers time out): keep every answer under
 about 350 words. Use ONE compact table for lists, show at most the top 10-15
 rows and say how many more there are, and never repeat the same data in a
 table and again in prose. Lead with the answer, then the table, then at most
-three short action points. Offer detail only if asked.`;
+three short action points. Offer detail only if asked.
+
+SHOWING ALL ROWS: tools cap their lists, and every capped list reports
+"shown" and "total". Always say plainly when you are showing only part of a
+list ("showing 20 of 37"). When the person asks for "all", "the rest", "the
+full list" or "the remaining ones": for the deadline-risk view call
+get_rll_deadline_risk again with show_all=true; for anything else use
+query_data on the underlying source with a higher limit (up to 200). Then
+list EVERY row as one compact table with no extra prose, up to 60 rows; if
+there are more than 60, show the first 60 and offer the next batch. Never
+reply that the rows exist without showing them when asked for them.`;
 
 const TOOLS = [
   {
@@ -246,7 +256,8 @@ const TOOLS = [
       + 'make the date" and "what processes are outstanding". qty defaults '
       + 'to the full project target (400).',
     input_schema: { type: 'object', properties: {
-      qty: { type: 'integer', description: 'RLL units to plan for. Defaults to the project target (400).' }
+      qty: { type: 'integer', description: 'RLL units to plan for. Defaults to the project target (400).' },
+      show_all: { type: 'boolean', description: 'Set true when the person asks for all rows / the rest / the full list. Raises the per-list cap from 20-25 to 60.' }
     }}
   },
   {
@@ -1037,7 +1048,7 @@ async function get_project_progress() {
   };
 }
 
-async function get_rll_deadline_risk(qtyArg) {
+async function get_rll_deadline_risk(qtyArg, showAll) {
   const [projRes, readiness, crossStoreMap, lt] = await Promise.all([
     supabase.from('projects').select('target_qty').eq('project_name', PROJECT_400).limit(1),
     cached('rll_readiness', 45000, async () => supabase.from('v_rll_build_readiness').select(RLL_READINESS_COLS)),
@@ -1103,6 +1114,9 @@ async function get_rll_deadline_risk(qtyArg) {
 
   const byGap = (a, b) => (b.short_by || b.still_to_order || 0) - (a.short_by || a.still_to_order || 0);
   const byLead = (a, b) => (b.lead_days ?? -1) - (a.lead_days ?? -1);
+  // Every list reports shown/total so the bot can say when it is partial.
+  const cap = showAll ? 60 : null;
+  const part = (list, dflt) => { const n = cap || dflt; return { shown: Math.min(list.length, n), total: list.length, rows: list.slice(0, n) }; };
 
   return {
     project: PROJECT_400,
@@ -1117,10 +1131,10 @@ async function get_rll_deadline_risk(qtyArg) {
       parts_in_holding_processes: wipToChase.length,
       not_ordered_with_no_lead_time_on_file: notOrdered.filter(x => x.lead_time_missing).length,
     },
-    not_ordered: notOrdered.sort(byLead).slice(0, 25),
-    partly_ordered: partlyOrdered.sort(byGap).slice(0, 20),
-    on_order_date_risk: onOrderRisk.slice(0, 20),
-    holding_store_processes_to_chase: wipToChase.slice(0, 20),
+    not_ordered: part(notOrdered.sort(byLead), 25),
+    partly_ordered: part(partlyOrdered.sort(byGap), 20),
+    on_order_date_risk: part(onOrderRisk, 20),
+    holding_store_processes_to_chase: part(wipToChase, 20),
     notes: [
       'Lead times come from part_lead_times, which is only partly filled (GRN40 entries by Lodewikus). A missing lead time is shown as lead_time_missing, never estimated.',
       'Parts fully covered by other product stores (other_store_stock) need a management transfer, not a PO.',
@@ -1843,7 +1857,7 @@ async function runTool(name, input) {
     if (name === 'get_sub_builds_hampering')      return await get_sub_builds_hampering();
     if (name === 'get_sub_build_priorities')      return await get_sub_build_priorities();
     if (name === 'get_project_progress')          return await get_project_progress();
-    if (name === 'get_rll_deadline_risk')         return await get_rll_deadline_risk(input.qty);
+    if (name === 'get_rll_deadline_risk')         return await get_rll_deadline_risk(input.qty, input.show_all === true);
     if (name === 'get_open_work_orders')          return await get_open_work_orders(input.project_name);
     if (name === 'get_open_po_value')             return await get_open_po_value();
     if (name === 'get_payables_summary')          return await get_payables_summary(input.project_name);
@@ -1903,7 +1917,7 @@ exports.handler = async function (event) {
           },
           body: JSON.stringify({
             model:      'claude-sonnet-4-6',
-            max_tokens: 1800,
+            max_tokens: 2400,
             system:     systemWithDate,
             tools:      TOOLS,
             messages:   conversation
