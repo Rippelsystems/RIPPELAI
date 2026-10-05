@@ -150,7 +150,21 @@ FINANCE / PO RULES (permanent business knowledge):
   until a tool returns real values. Say the data has not been captured yet.
 
 Never guess. Always call the appropriate tool. Always state currency as
-R (ZAR). Be concise and direct — these are busy operational stakeholders.`;
+R (ZAR). Be concise and direct — these are busy operational stakeholders.
+
+GENERAL QUESTIONS (no specific tool fits): use list_data_sources, then
+list_data_sources(source) to get that source's REAL columns, then query_data
+(filters, sorting, or group_by with sum_columns for totals). Never guess a
+column name. Prefer a specific tool when one fits. Use at most three or four
+query_data calls per answer, and say plainly if the data needed is not in any
+available source. Remember "po_lines" values exclude 15% VAT and Finance pays
+per PO, not per line.
+
+ANSWER LENGTH (important — long answers time out): keep every answer under
+about 350 words. Use ONE compact table for lists, show at most the top 10-15
+rows and say how many more there are, and never repeat the same data in a
+table and again in prose. Lead with the answer, then the table, then at most
+three short action points. Offer detail only if asked.`;
 
 const TOOLS = [
   {
@@ -344,6 +358,40 @@ const TOOLS = [
     }, required: ['project_name'] }
   },
   {
+    name: 'list_data_sources',
+    description: 'Lists the tables and views the assistant is allowed to read, '
+      + 'with a one-line description of each. Pass a source name to also get '
+      + 'its REAL column names and one sample row (always do this before '
+      + 'query_data on a source you have not used in this conversation — never '
+      + 'guess column names). Use for any question no specific tool covers.',
+    input_schema: { type: 'object', properties: {
+      source: { type: 'string', description: 'Optional table/view name to get its columns and a sample row.' }
+    }}
+  },
+  {
+    name: 'query_data',
+    description: 'Flexible READ-ONLY lookup on one allowed table/view: choose '
+      + 'columns, filter, sort, limit — or group and total. Use for questions '
+      + 'the specific tools do not cover. Prefer a specific tool when one '
+      + 'fits. Call list_data_sources(source) first to get real column names. '
+      + 'Keep it to a few calls per answer. For totals/counts per group set '
+      + 'group_by (and sum_columns); otherwise rows are returned (max 200).',
+    input_schema: { type: 'object', properties: {
+      source:  { type: 'string', description: 'Allowed table/view name from list_data_sources.' },
+      select:  { type: 'string', description: 'Comma-separated column names, or * (default). No functions or joins.' },
+      filters: { type: 'array', description: 'AND-ed conditions.', items: { type: 'object', properties: {
+        column: { type: 'string' },
+        op:     { type: 'string', description: 'eq, neq, gt, gte, lt, lte, like, ilike, in, is_null, not_null' },
+        value:  { description: 'Value to compare (array for "in"; use % wildcards for like/ilike). Not needed for is_null/not_null.' }
+      }, required: ['column', 'op'] } },
+      order_by:  { type: 'string', description: 'Column to sort by (rows mode).' },
+      descending:{ type: 'boolean', description: 'Sort descending. Default false.' },
+      limit:     { type: 'integer', description: 'Max rows/groups. Default 50, max 200.' },
+      group_by:  { type: 'string', description: 'Column to group by; returns one row per value with a count and sums.' },
+      sum_columns: { type: 'array', items: { type: 'string' }, description: 'Numeric columns to total per group (with group_by).' }
+    }, required: ['source'] }
+  },
+  {
     name: 'list_projects',
     description: 'Returns all project names/codes currently in the system, '
       + 'with their budget and status. Use when the user asks what projects '
@@ -354,6 +402,18 @@ const TOOLS = [
 ];
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+// Short-lived cache (warm function instances only) so the same heavy view is
+// not queried several times inside one conversation.
+const _cache = new Map();
+async function cached(key, ttlMs, loader) {
+  const hit = _cache.get(key);
+  if (hit && Date.now() - hit.t < ttlMs) return hit.v;
+  const v = await loader();
+  if (!v || !v.error) _cache.set(key, { t: Date.now(), v });
+  return v;
+}
+
 
 const num = v => Number(v) || 0;
 const r2  = v => Math.round((v + Number.EPSILON) * 100) / 100;
@@ -368,7 +428,8 @@ function vat3(excl) {
 async function fetchAll(table, cols, opts = {}) {
   const out = [];
   const size = 1000;
-  for (let from = 0; from < 50000; from += size) {
+  const maxRows = opts.maxRows || 50000;
+  for (let from = 0; from < maxRows; from += size) {
     let q = supabase.from(table).select(cols).range(from, from + size - 1);
     if (opts.order) q = q.order(opts.order, { ascending: true });
     if (opts.mod)   q = opts.mod(q);
@@ -472,16 +533,22 @@ const RLL_READINESS_COLS =
 // ── Stock tools ──────────────────────────────────────────────────────────────
 
 async function get_rll_shortfall(qty = 1) {
-  const { data: allRows, error } = await supabase
-    .from('v_rll_build_readiness').select(RLL_READINESS_COLS);
+  const [{ data: allRows, error }, crossStoreMap, ltRes] = await Promise.all([
+    cached('rll_readiness', 45000, async () => supabase.from('v_rll_build_readiness').select(RLL_READINESS_COLS)),
+    getCrossStoreMap(),
+    supabase.from('part_lead_times').select('stock_code, supplier, lead_days').limit(5000)
+  ]);
   if (error) return { error: `Query failed: ${error.message}` };
-
-  const crossStoreMap = await getCrossStoreMap();
+  const leadMap = {};
+  for (const l of (ltRes.data || [])) if (l.stock_code) leadMap[l.stock_code] = l;
 
   const shortages = buildShortfallResult(allRows, qty, 'need_for_1_rll').map(r => {
     const crossStore = crossStoreMap[r.stock_code] || 0;
+    const lt = leadMap[r.stock_code] || leadMap[(r.stock_code || '').split('_')[0]];
     return {
       ...r,
+      lead_days: lt && lt.lead_days != null ? lt.lead_days : undefined,
+      lead_time_on_file: lt ? undefined : false,
       other_store_stock: crossStore || undefined,
       other_store_note: crossStore >= r.needs_sourcing && crossStore > 0
         ? 'Fully covered by other product store stock — management transfer required'
@@ -579,6 +646,10 @@ function targetFromProject(projRes) {
 // every assembly recursively, exactly as frm_production_progress.py does.
 
 async function loadProgressModel() {
+  return cached('progress_model', 45000, loadProgressModelUncached);
+}
+
+async function loadProgressModelUncached() {
   const byProject = q => q.eq('project_name', PROJECT_400);
   const [projRes, prog, eff, deps] = await Promise.all([
     supabase.from('projects').select('project_name, target_qty, start_date, end_date')
@@ -969,7 +1040,7 @@ async function get_project_progress() {
 async function get_rll_deadline_risk(qtyArg) {
   const [projRes, readiness, crossStoreMap, lt] = await Promise.all([
     supabase.from('projects').select('target_qty').eq('project_name', PROJECT_400).limit(1),
-    supabase.from('v_rll_build_readiness').select(RLL_READINESS_COLS),
+    cached('rll_readiness', 45000, async () => supabase.from('v_rll_build_readiness').select(RLL_READINESS_COLS)),
     getCrossStoreMap(),
     supabase.from('part_lead_times').select('stock_code, item_name, supplier, lead_days').limit(5000)
   ]);
@@ -1046,10 +1117,10 @@ async function get_rll_deadline_risk(qtyArg) {
       parts_in_holding_processes: wipToChase.length,
       not_ordered_with_no_lead_time_on_file: notOrdered.filter(x => x.lead_time_missing).length,
     },
-    not_ordered: notOrdered.sort(byLead).slice(0, 40),
-    partly_ordered: partlyOrdered.sort(byGap).slice(0, 40),
-    on_order_date_risk: onOrderRisk.slice(0, 40),
-    holding_store_processes_to_chase: wipToChase.slice(0, 40),
+    not_ordered: notOrdered.sort(byLead).slice(0, 25),
+    partly_ordered: partlyOrdered.sort(byGap).slice(0, 20),
+    on_order_date_risk: onOrderRisk.slice(0, 20),
+    holding_store_processes_to_chase: wipToChase.slice(0, 20),
     notes: [
       'Lead times come from part_lead_times, which is only partly filled (GRN40 entries by Lodewikus). A missing lead time is shown as lead_time_missing, never estimated.',
       'Parts fully covered by other product stores (other_store_stock) need a management transfer, not a PO.',
@@ -1615,6 +1686,152 @@ async function get_project_financial_summary(project_name) {
   };
 }
 
+
+// ── Generic read-only data access (whitelisted sources only) ────────────────
+
+const DATA_SOURCES = {
+  // Build / stock
+  v_rll_build_readiness:   'RLL BOM readiness per line: stock, WO/service-order committed, holding (process) qty, on order, supplier ETA',
+  v_grn40_build_readiness: 'GRN40 BOM readiness per line (same shape as the RLL one)',
+  v_rll_build_progress:    'Production Progress per BOM line for a project (project_name): ready / process / on order / gap bands',
+  v_rll_build_effective:   'Production Progress lines with parent-buffer correction: effective_need, needs_sourcing, ETAs',
+  build_dependencies:      'Build Sequence rules: which assembly waits for which, with sequence_no',
+  stock_items:             'Stock rows per part and storeroom (stock_code, stock_qty, storeroom, batch_ref)',
+  part_lead_times:         'Supplier lead times per part (partly filled)',
+  work_orders:             'Work orders; customer holds the project name',
+  service_orders:          'Open/closed service orders (LSO/ESO) — parts out on external processes',
+  rejection_tracking:      'QC rejections per delivery/part with status and quantities',
+  weapon_serials:          'Blue Card serial register: serial, card_type, status per contract',
+  // Purchasing / finance
+  po_lines:                'PO delivery lines: po_number, description, qty_ordered, qty_received, unit_price (excl VAT), committed_date, line_status',
+  po_deliveries:           'Actual deliveries received against POs, with dates',
+  supplier_po:             'PO headers/lines with supplier, project, product, po_type',
+  suppliers:               'Supplier master list',
+  v_po_payables:           'Per PMS PO: committed, received, outstanding, Finance paid/pending, received-not-paid, paid-not-received (excl VAT)',
+  v_payment_forecast_lines:'Outstanding PO lines with forecast pay date (committed date + 30 days)',
+  v_po_line_commitment:    'Per PO line ordered/received/committed value, over-receipt flags, project, product',
+  v_finance_po_reconciliation: 'Finance vs PMS PO reconciliation: paid, pending, difference, outcome, credit notes',
+  finance_payment_lines:   'Finance payment lines synced from SharePoint',
+  // Projects
+  projects:                'Projects: name, product, status, budget, target_qty, dates, manager',
+  contracts:               'Contract values per project (currently empty)',
+  project_deposits:        'Customer deposits per project (currently empty)',
+  contract_opex:           'Non-PO operating costs per project',
+  project_fund_transfers:  'Fund transfers between projects',
+  consumable_project_allocations: 'Paint/sand consumable cost allocated to projects'
+};
+
+const validIdent = x => typeof x === 'string' && /^[A-Za-z0-9_]+$/.test(x);
+
+function trimCell(v) {
+  return typeof v === 'string' && v.length > 120 ? v.slice(0, 120) + '…' : v;
+}
+function trimRows(rows) {
+  return rows.map(r => { const o = {}; for (const [k, v] of Object.entries(r)) o[k] = trimCell(v); return o; });
+}
+function capPayload(obj, key) {
+  // keep the JSON handed to the model small (speed + token cost)
+  let rows = obj[key];
+  while (rows.length > 1 && JSON.stringify(obj).length > 14000) {
+    rows = rows.slice(0, Math.max(1, Math.floor(rows.length * 0.7)));
+    obj[key] = rows; obj.truncated_for_size = true;
+  }
+  return obj;
+}
+
+async function list_data_sources(source) {
+  if (!source) {
+    return {
+      sources: Object.entries(DATA_SOURCES).map(([name, description]) => ({ name, description })),
+      note: 'Read-only. Call list_data_sources with a source name to see its real columns before querying it.'
+    };
+  }
+  if (!DATA_SOURCES[source]) return { error: `"${source}" is not an available source. Use list_data_sources with no argument to see the list.` };
+  const { data, error } = await supabase.from(source).select('*').limit(1);
+  if (error) return { error: `Could not read ${source}: ${error.message}` };
+  if (!data || data.length === 0) {
+    return { source, description: DATA_SOURCES[source], columns: null,
+      note: 'No rows came back — the table may be empty, or the bot has no read access to it (RLS returns zero rows silently), so columns are unknown.' };
+  }
+  return { source, description: DATA_SOURCES[source], columns: Object.keys(data[0]), sample_row: trimRows(data)[0] };
+}
+
+async function query_data(args) {
+  const source = args.source;
+  if (!DATA_SOURCES[source]) return { error: `"${source}" is not an available source. Use list_data_sources to see the list.` };
+
+  const selParts = String(args.select || '*').split(',').map(x => x.trim()).filter(Boolean);
+  for (const c of selParts) if (c !== '*' && !validIdent(c)) return { error: `Invalid column "${c}" in select (plain column names only).` };
+  const sel = selParts.join(',') || '*';
+
+  const filters = Array.isArray(args.filters) ? args.filters : [];
+  for (const f of filters) if (!validIdent(f.column)) return { error: `Invalid filter column "${f.column}".` };
+  if (args.order_by && !validIdent(args.order_by)) return { error: `Invalid order_by "${args.order_by}".` };
+  if (args.group_by && !validIdent(args.group_by)) return { error: `Invalid group_by "${args.group_by}".` };
+  const sums = (Array.isArray(args.sum_columns) ? args.sum_columns : []);
+  for (const c of sums) if (!validIdent(c)) return { error: `Invalid sum column "${c}".` };
+
+  const applyFilters = q => {
+    for (const f of filters) {
+      const v = f.value;
+      switch (f.op) {
+        case 'eq':  q = q.eq(f.column, v); break;
+        case 'neq': q = q.neq(f.column, v); break;
+        case 'gt':  q = q.gt(f.column, v); break;
+        case 'gte': q = q.gte(f.column, v); break;
+        case 'lt':  q = q.lt(f.column, v); break;
+        case 'lte': q = q.lte(f.column, v); break;
+        case 'like':  q = q.like(f.column, String(v)); break;
+        case 'ilike': q = q.ilike(f.column, String(v)); break;
+        case 'in':  q = q.in(f.column, Array.isArray(v) ? v : [v]); break;
+        case 'is_null':  q = q.is(f.column, null); break;
+        case 'not_null': q = q.not(f.column, 'is', null); break;
+        default: throw new Error(`Unsupported filter operator "${f.op}".`);
+      }
+    }
+    return q;
+  };
+
+  try {
+    // Grouped totals: pull up to 5,000 matching rows and aggregate here
+    if (args.group_by) {
+      const cols = [args.group_by, ...sums].join(',');
+      const res = await fetchAll(source, cols, { order: args.group_by, mod: applyFilters, maxRows: 5000 });
+      if (res.error) return { error: res.error };
+      const groups = {};
+      for (const r of res.data) {
+        const k = r[args.group_by] === null || r[args.group_by] === undefined ? 'NULL' : String(r[args.group_by]);
+        if (!groups[k]) { groups[k] = { [args.group_by]: k, row_count: 0 }; for (const c of sums) groups[k][c + '_total'] = 0; }
+        groups[k].row_count++;
+        for (const c of sums) groups[k][c + '_total'] += num(r[c]);
+      }
+      const sortKey = sums.length ? sums[0] + '_total' : 'row_count';
+      const limit = Math.min(Math.max(parseInt(args.limit) || 30, 1), 100);
+      const list = Object.values(groups).sort((a, b) => num(b[sortKey]) - num(a[sortKey]));
+      const out = { source, group_by: args.group_by, groups_total: list.length, groups: list.slice(0, limit).map(g => {
+        const o = {}; for (const [k, v] of Object.entries(g)) o[k] = typeof v === 'number' ? r2(v) : v; return o; }),
+        rows_scanned: res.data.length,
+        note: res.data.length >= 5000 ? 'Scanned the first 5,000 matching rows only — totals may be incomplete; narrow the filters.' : undefined };
+      return capPayload(out, 'groups');
+    }
+
+    // Plain rows
+    const limit = Math.min(Math.max(parseInt(args.limit) || 50, 1), 200);
+    let q = supabase.from(source).select(sel);
+    q = applyFilters(q);
+    if (args.order_by) q = q.order(args.order_by, { ascending: !args.descending });
+    q = q.limit(limit);
+    const { data, error } = await q;
+    if (error) return { error: `Query on ${source} failed: ${error.message}` };
+    const out = { source, row_count: data.length, rows: trimRows(data),
+      note: data.length === 0 ? 'No rows. Either nothing matches, or the bot has no read access to this table (RLS returns zero rows silently).'
+        : (data.length >= limit ? `Showing the first ${limit} rows — there may be more.` : undefined) };
+    return data.length ? capPayload(out, 'rows') : out;
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
 // ── Router ──────────────────────────────────────────────────────────────────
 
 async function runTool(name, input) {
@@ -1637,6 +1854,8 @@ async function runTool(name, input) {
     if (name === 'get_po_reconciliation_summary') return await get_po_reconciliation_summary();
     if (name === 'get_po_reconciliation_issues')  return await get_po_reconciliation_issues(input.outcome_filter);
     if (name === 'get_project_financial_summary') return await get_project_financial_summary(input.project_name);
+    if (name === 'list_data_sources')             return await list_data_sources(input.source);
+    if (name === 'query_data')                    return await query_data(input);
     if (name === 'list_projects')                 return await list_projects();
     return { error: `Unknown tool: ${name}` };
   } catch (err) {
@@ -1650,6 +1869,12 @@ exports.handler = async function (event) {
   if (event.httpMethod !== 'POST')
     return { statusCode: 405, body: 'Method Not Allowed' };
 
+  const started = Date.now();
+  const BUDGET_MS = 52000;     // Netlify cuts synchronous functions off at 60s
+  const elapsed = () => Date.now() - started;
+  const say = text => ({ statusCode: 200, headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ stop_reason: 'end_turn', content: [{ type: 'text', text }] }) });
+
   try {
     const { messages } = JSON.parse(event.body);
     let conversation  = [...messages];
@@ -1660,32 +1885,46 @@ exports.handler = async function (event) {
       + `\n\nTODAY'S DATE: ${todayStr}. Days remaining to the 2026 400 RLL delivery deadline (${DEADLINE_400}): ${daysUntil(DEADLINE_400)}.`;
 
     for (let i = 0; i < 8; i++) {
-      const res  = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type':      'application/json',
-          'x-api-key':         ANTHROPIC_API_KEY,
-          'anthropic-version': '2023-06-01'
-        },
-        body: JSON.stringify({
-          model:      'claude-sonnet-4-6',
-          max_tokens: 2500,
-          system:     systemWithDate,
-          tools:      TOOLS,
-          messages:   conversation
-        })
-      });
+      const remaining = BUDGET_MS - elapsed();
+      if (remaining < 8000) {
+        console.log(`[chat] out of time before iteration ${i} at ${elapsed()}ms`);
+        return say('That question needed more time than this chat allows (60 seconds). Please ask for a narrower version — for example "top 10 only", or one tool at a time — and I will answer it straight away.');
+      }
+      const t0 = Date.now();
+      let res;
+      try {
+        res = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          signal: AbortSignal.timeout(remaining),
+          headers: {
+            'Content-Type':      'application/json',
+            'x-api-key':         ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01'
+          },
+          body: JSON.stringify({
+            model:      'claude-sonnet-4-6',
+            max_tokens: 1800,
+            system:     systemWithDate,
+            tools:      TOOLS,
+            messages:   conversation
+          })
+        });
+      } catch (e) {
+        console.log(`[chat] Claude call ${i} aborted after ${Date.now() - t0}ms: ${e.message}`);
+        return say('The answer took too long to write and was cut off at the 60-second limit. Please ask for a shorter version (for example "top 10 only") and I will answer it straight away.');
+      }
       const data = await res.json();
+      console.log(`[chat] Claude call ${i}: ${Date.now() - t0}ms, stop=${data.stop_reason}, out_tokens=${data.usage && data.usage.output_tokens}`);
 
       if (data.stop_reason === 'tool_use') {
         conversation.push({ role: 'assistant', content: data.content });
-        // Run all requested tools at the same time (Netlify times out at ~10-26s)
-        const results = await Promise.all(
-          data.content.filter(b => b.type === 'tool_use').map(async block => ({
-            type: 'tool_result', tool_use_id: block.id,
-            content: JSON.stringify(await runTool(block.name, block.input))
-          }))
-        );
+        const tools = data.content.filter(b => b.type === 'tool_use');
+        const results = await Promise.all(tools.map(async block => {
+          const t1 = Date.now();
+          const out = JSON.stringify(await runTool(block.name, block.input));
+          console.log(`[chat] tool ${block.name}: ${Date.now() - t1}ms, ${out.length} chars`);
+          return { type: 'tool_result', tool_use_id: block.id, content: out };
+        }));
         conversation.push({ role: 'user', content: results });
         continue;
       }
@@ -1693,12 +1932,15 @@ exports.handler = async function (event) {
       break;
     }
 
+    if (!finalResponse) return say('I could not finish that in the allowed steps. Please ask a narrower question.');
+    console.log(`[chat] done in ${elapsed()}ms`);
     return {
       statusCode: 200,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(finalResponse)
     };
   } catch (err) {
+    console.log(`[chat] error after ${elapsed()}ms: ${err.message}`);
     return { statusCode: 500, body: JSON.stringify({ error: err.message }) };
   }
 };
