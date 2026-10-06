@@ -2,14 +2,10 @@
 // chat.js — Netlify serverless function  (RippelAI / Rippel Matrix)
 // Read-only AI layer over the Matrix Supabase data.
 //
-// 06-10-2026: added get_unit_component_cost — component-only cost of one
-// finished RLL or GRN40, rolled up from the BOM readiness view and priced
-// first from the Component Pricing screen (frm_pricing.py →
-// component_pricing), then from the latest purchase PO line (service POs
-// excluded). component_pricing is also added to the query_data sources.
-// Nothing else changed.
-// System prompt gains a COMPONENT COST section; stock_items source
-// description now mentions its price columns. Nothing else changed.
+// 06-10-2026: added get_unit_component_cost — cost of one finished RLL,
+// GRN40 or XRGL40 (or a named sub-assembly), a direct port of the Matrix
+// Build Cost Calculator (frm_costing.py) so both give the same figure.
+// component_pricing added to the query_data sources. Nothing else changed.
 // ============================================================
 
 const { createClient } = require('@supabase/supabase-js');
@@ -52,26 +48,28 @@ PRODUCT NOTES:
 - RLL launchers do not carry sights. XRGL40 launchers carry a GRN40 sight.
 
 COMPONENT COST PER UNIT:
-- Component prices ARE held in Matrix: the Component Pricing screen
-  (invoice prices, table component_pricing) is the main source, and every
-  PO line carries a unit price (excl VAT). Never say costing is not in the
-  system. stock_items.unit_price is mostly empty — never use
-  it to conclude a part has no price.
-- "What does an RLL / a GRN40 sight cost to build", "component cost per
-  unit", "BOM cost" -> get_unit_component_cost (product RLL or GRN40).
-- That figure is an ESTIMATED standard cost: quantity per finished unit
-  from the BOM x the price on file. It is NOT actual project spend — say
-  so. It covers component purchase price only: outside processing
-  (LSO/ESO), annealing, paint/sand, freight, labour and overheads are
-  excluded — say so in one line.
-- Always state how many BOM lines were priced and how many were not. If
-  any line has no price, the total is understated — say so and list the
-  unpriced lines when asked.
-- XRGL40 has no BOM view the assistant can read yet — say so plainly.
-- Show the total excl. VAT, VAT and incl. VAT, then the cost by
-  sub-assembly and the costliest lines.
+- Component prices ARE held in Matrix. Never say costing is not in the
+  system.
+- "What does an RLL / a GRN40 sight / an XRGL40 cost to build", "cost of
+  the <sub-assembly>", "BOM cost", "unit cost" -> get_unit_component_cost.
+  It uses exactly the same calculation as the Matrix Build Cost Calculator
+  screen, so its total matches that screen. Say so.
+- The figure is an ESTIMATED standard cost from captured prices — NOT
+  actual project spend. A part's price is the sum of its process steps
+  (e.g. machining + surface treatment), so outside processing IS included.
+  Labour, overheads and freight are not — say so in one line.
+- Report the screen status line as given. If parts deeper in the tree have
+  no price, say how many and that the total is understated by them, and
+  give each one's "why" (bought on another product's PO, other sizes
+  priced only, or no purchase record — probably opening stock).
+- Show the total excl. VAT, VAT and incl. VAT, then the top-level lines,
+  then the costliest parts.
 - Do not refer the user to "the Matrix admin" or to another person for
   data that a tool can return.
+- ALWAYS call get_unit_component_cost afresh for every cost question, even
+  if the same question was answered earlier in this conversation. Prices
+  and the BOM change during the day; never repeat figures from an earlier
+  answer.
 
 KEY PROJECT AND DEADLINE:
 - Project "2026 400 RLL": 400 RLL units must be DELIVERED by the end of
@@ -233,17 +231,19 @@ const TOOLS = [
   },
   {
     name: 'get_unit_component_cost',
-    description: 'ESTIMATED component cost of ONE finished RLL or GRN40 sight: '
-      + 'BOM quantity per unit x the latest price on the Component Pricing '
-      + 'screen, else the latest purchase PO line price, excl VAT, '
-      + 'VAT and incl VAT, with cost per sub-assembly, the costliest lines, '
-      + 'and every line with no price. Component purchase price only — '
-      + 'excludes outside processing, annealing, paint, freight, labour and '
-      + 'overheads. Use for "what does an RLL cost to build", "component '
-      + 'cost per unit", "BOM cost".',
+    description: 'ESTIMATED cost of ONE finished RLL, GRN40 sight or XRGL40 — or '
+      + 'of any named sub-assembly — calculated EXACTLY like the Matrix Build '
+      + 'Cost Calculator screen (frm_costing.py): BOM from stock items, each '
+      + 'part priced as the SUM of its process steps on that product\'s PO '
+      + 'lines, fasteners by BN spec from the Component Pricing screen. '
+      + 'Returns excl VAT, VAT and incl VAT, the top-level lines, the '
+      + 'costliest parts and parts with no price. Use for "what does an RLL '
+      + 'cost to build", "cost of the front group", "BOM cost", "unit cost".',
     input_schema: { type: 'object', properties: {
-      product: { type: 'string', description: 'RLL or GRN40. Defaults to RLL.' },
-      show_all: { type: 'boolean', description: 'Set true when the person asks for all lines / the full list. Raises the line list cap from 15 to 60.' }
+      product:  { type: 'string', description: 'RLL, GRN40 or XRGL40. Defaults to RLL.' },
+      assembly: { type: 'string', description: 'Optional assembly item name, e.g. "FRONT GROUP". Defaults to the product\'s complete unit (RLL COMPLETE for RLL).' },
+      qty:      { type: 'integer', description: 'Optional build quantity. Defaults to 1.' },
+      show_all: { type: 'boolean', description: 'Set true when the person asks for all lines / the full list. Raises list caps from 15 to 60.' }
     }}
   },
   {
@@ -631,214 +631,312 @@ async function get_grn40_shortfall(qty = 1) {
   return { product: 'GRN40', build_qty: qty, total_shortages: shortages.length, shortages };
 }
 
-// ── Component cost per finished unit (06-10-2026) ───────────────────────────
-// ESTIMATED standard component cost of ONE finished unit.
-//   Quantity: need_for_1_* from the BOM readiness view (quantity per finished
-//             unit, the same column the shortfall tools scale by qty).
-//   Lines:    leaf lines only (no BOM children), so an assembly is never
-//             costed on top of its own parts; CONTAINER rows and STTE Store
-//             rows skipped.
-//   Price:    FIRST the Component Pricing screen (frm_pricing.py →
-//             component_pricing): the latest record per part, ordered by
-//             price_date then created_at, as on its Latest Prices tab.
-//             Matched on stock_code (exact, then without the process
-//             suffix, then the part's BN number from stock_items.
-//             supplier_code), then on item name within the same product — the
-//             Latest Prices tab itself groups by item name.
-//             THEN, where nothing has been captured on that screen, the most
-//             recent purchase PO line (po_lines.unit_price, excl VAT, any
-//             project — a shared part costs the same whichever project
-//             bought it): internal_part_no exact → base code →
-//             supplier_item_code (BN number). Service POs (-GS / -RS / -XS)
-//             and cancelled lines are ignored: those are process costs.
-//             LAST, a pricing record with the same item name on another
-//             product, flagged for checking.
-//             stock_items.unit_price is NOT used: on LIVE only 2 of 812 rows
-//             carry a price (06-10-2026).
-//   Excludes: outside processing, annealing, paint/sand, freight, labour,
-//             overheads. Read-only.
+// ── Component cost per unit — port of frm_costing.py (06-10-2026) ────────────
+// Same answer as the Matrix Build Cost Calculator (frm_costing.py), line for
+// line:
+//   BOM:    stock_items. Children of an assembly = rows whose dependant_code
+//           equals the assembly's component_id, same product (case-
+//           insensitive retry), qty = build_req (default 1). If none, the
+//           build_items fallback. A child with zero stock is swapped for
+//           another row with the same item_name + stock_code + product that
+//           has stock (_get_bom_fast).
+//   Cost:   a row with its own children = the sum of its children (never a
+//           flat price on the assembly row). A leaf = _get_all_prices():
+//           SUM of every distinct process-step price on po_lines whose
+//           internal_part_no is the stock code or starts with "<code>_",
+//           plus blank-part-no lines whose description = item name, only on
+//           POs whose supplier_po.product is the selected product; first
+//           row per distinct part no / description wins. Then, if none:
+//           BN-spec match of stock_items.supplier_code against
+//           component_pricing.stock_code (letters+digits only, trailing MM
+//           dropped, latest price_date first); then component_pricing by
+//           stock_item_id; then by item name.
+//   Top level: each line's stock_code is first resolved to the product's
+//           own stock_items row, as _recalculate() does.
+// Differences from the screen, both deliberate: this reads every row in
+// pages (the screen asks for limit 5000/10000, which Supabase may cap at
+// 1000), and po_lines are read in id order (the screen's order is
+// unspecified). Read-only.
 
-const COST_VIEWS = {
-  RLL:   { view: 'v_rll_build_readiness',   needCol: 'need_for_1_rll',   label: 'RLL',         product: 'RLL' },
-  GRN40: { view: 'v_grn40_build_readiness', needCol: 'need_for_1_grn40', label: 'GRN40 sight', product: 'GRN40' },
+const BN_NORM = s => {
+  let v = String(s || '').trim().toUpperCase().replace(/×/g, 'X').replace(/[^A-Z0-9]/g, '');
+  if (v.endsWith('MM')) v = v.slice(0, -2);
+  return v;
 };
+const DEFAULT_ROOTS = { RLL: 'RLL COMPLETE' };
 
-// Codes are compared case-blind, with long/short dashes and spacing made
-// uniform ("BN8699 – M10 X 20MM" = "BN8699 - M10 x 20mm").
-const normCode = c => String(c || '').toUpperCase().replace(/[\u2010-\u2015\u2212]/g, '-')
-  .replace(/\s+/g, ' ').trim();
-const baseCode = c => normCode(c).split('_')[0].trim();
-const normName = c => String(c || '').trim().toUpperCase().replace(/\s+/g, ' ');
-const isServicePo = po => /-[GRX]S$/i.test(String(po || '').trim().split('/')[0]);
-
-async function get_unit_component_cost(productArg, showAll) {
+async function get_unit_component_cost(productArg, showAll, assemblyArg, qtyArg) {
   const p = String(productArg || 'RLL').toUpperCase().replace(/\s+/g, '');
-  const key = p === 'GRN' || p === 'GRN40SIGHT' ? 'GRN40' : p;
-  const cfg = COST_VIEWS[key];
-  if (!cfg) {
-    return { error: `No BOM costing is available for "${productArg}". Available: RLL and GRN40. XRGL40 has no BOM readiness view the assistant can read yet.` };
+  const product = p === 'GRN' ? 'GRN40' : (p === 'XRGL' ? 'XRGL40' : p);
+  if (!['RLL', 'GRN40', 'XRGL40'].includes(product)) {
+    return { error: `Unknown product "${productArg}". Use RLL, GRN40 or XRGL40.` };
   }
+  const qtyBuild = Math.max(1, parseInt(qtyArg) || 1);
 
-  const [bom, si, pl, cp] = await Promise.all([
-    fetchAll(cfg.view, `component_id, dependant_code, item_name, stock_code, storeroom, build_status, is_assembly_group, ${cfg.needCol}`,
-      { order: 'component_id' }),
+  const [si, bi, pl, sp, cp] = await Promise.all([
     fetchAll('stock_items', '*', { order: 'id' }),
-    fetchAll('po_lines', '*', { order: 'id', mod: q => q.gt('unit_price', 0) }),
-    fetchAll('component_pricing', 'id, stock_item_id, item_name, stock_code, supplier, po_number, invoice_number, unit_price, currency, price_date, product, created_at',
+    fetchAll('build_items', 'assembly_id, component_id, qty_required', { order: 'assembly_id' }),
+    fetchAll('po_lines', '*', { order: 'id' }),
+    fetchAll('supplier_po', 'po_number, product', { order: 'po_number' }),
+    fetchAll('component_pricing', 'id, item_name, stock_item_id, stock_code, unit_price, price_date, supplier, notes',
       { order: 'id', mod: q => q.gt('unit_price', 0) })
   ]);
-  if (bom.error) return { error: bom.error };
-  if (bom.data.length === 0) return { error: `${cfg.view} returned no rows.` };
-  if (pl.error)  return { error: pl.error };
-  const cpWarning = cp.error ? `The Component Pricing records (component_pricing) could not be read (${cp.error}); PO prices only.` : null;
+  for (const [name, r] of [['stock_items', si], ['po_lines', pl], ['supplier_po', sp], ['component_pricing', cp]]) {
+    if (r.error) return { error: `${name}: ${r.error}` };
+  }
+  const items = si.data;
+  const buildItems = bi.error ? [] : bi.data;
 
-  const put = (map, k, rec) => {
-    if (!k) return;
-    const cur = map[k];
-    map[k] = cur
-      ? { ...rec, min: Math.min(cur.min, rec.price), max: Math.max(cur.max, rec.price), pos: cur.pos + 1 }
-      : { ...rec, min: rec.price, max: rec.price, pos: 1 };
+  // ── BOM index (_ensure_full_index / _get_bom_fast) ──
+  const byId = new Map(items.map(r => [r.id, r]));
+  const kidsByDep = new Map(), byNameCodeProd = new Map();
+  for (const r of items) {
+    const dep = String(r.dependant_code || '').trim();
+    if (dep) { if (!kidsByDep.has(dep)) kidsByDep.set(dep, []); kidsByDep.get(dep).push(r); }
+    const k = `${r.item_name || ''}|${r.stock_code || ''}|${r.product || ''}`;
+    if (!byNameCodeProd.has(k)) byNameCodeProd.set(k, []);
+    byNameCodeProd.get(k).push(r);
+  }
+  const biByAsm = new Map();
+  for (const r of buildItems) { if (!biByAsm.has(r.assembly_id)) biByAsm.set(r.assembly_id, []); biByAsm.get(r.assembly_id).push(r); }
+
+  const bomCache = new Map();
+  const getBom = id => {
+    if (bomCache.has(id)) return bomCache.get(id);
+    const asm = byId.get(id);
+    let bom = [];
+    if (asm) {
+      const pcid = String(asm.component_id || '').trim();
+      const prod = String(asm.product || '').trim();
+      if (pcid) {
+        let kids = kidsByDep.get(pcid) || [];
+        if (prod) kids = kids.filter(c => (c.product || '') === prod);
+        if (!kids.length) {
+          const pcl = pcid.toLowerCase();
+          kids = items.filter(r => String(r.dependant_code || '').trim().toLowerCase() === pcl);
+          if (prod) kids = kids.filter(c => (c.product || '') === prod);
+        }
+        for (const c of kids) {
+          let rid = c.id;
+          if (!(num(c.stock_qty) > 0)) {
+            for (const alt of (byNameCodeProd.get(`${c.item_name || ''}|${c.stock_code || ''}|${c.product || ''}`) || [])) {
+              if (alt.id !== c.id && num(alt.stock_qty) > 0) { rid = alt.id; break; }
+            }
+          }
+          bom.push({ id: rid, item_name: c.item_name || '', stock_code: c.stock_code || '',
+            supplier_code: c.supplier_code || '', qty_required: num(c.build_req) || 1,
+            storeroom: c.storeroom || '' });
+        }
+      }
+      if (!bom.length) {
+        const seen = new Set();
+        for (const r of (biByAsm.get(id) || [])) {
+          if (seen.has(r.component_id)) continue;
+          seen.add(r.component_id);
+          const c = byId.get(r.component_id);
+          if (c) bom.push({ id: c.id, item_name: c.item_name || '', stock_code: c.stock_code || '',
+            supplier_code: c.supplier_code || '', qty_required: num(r.qty_required) || 1,
+            storeroom: c.storeroom || '' });
+        }
+      }
+    }
+    bom.sort((a, b) => a.item_name.localeCompare(b.item_name));
+    bomCache.set(id, bom);
+    return bom;
   };
 
-  // Component Pricing screen records — sorted oldest → newest by price_date,
-  // then created_at, so the latest record wins (same as its Latest Prices tab).
-  const cpRows = (cp.data || [])
-    .filter(r => !r.currency || String(r.currency).toUpperCase() === 'ZAR')
-    .sort((x, y) => String(x.price_date || '').localeCompare(String(y.price_date || ''))
-                 || String(x.created_at || '').localeCompare(String(y.created_at || '')));
-  const cpCode = {}, cpBase = {}, cpOwn = {}, cpAny = {};
-  let cpLinked = 0;
-  for (const r of cpRows) {
-    const rec = { price: num(r.unit_price), po: r.po_number || null, invoice: r.invoice_number || null,
-                  date: r.price_date ? String(r.price_date).slice(0, 10) : null };
-    if (normCode(r.stock_code)) { cpLinked++; put(cpCode, normCode(r.stock_code), rec); put(cpBase, baseCode(r.stock_code), rec); }
-    const n = normName(r.item_name);
-    put(cpAny, n, rec);
-    if (String(r.product || '').toUpperCase().replace(/\s+/g, '') === cfg.product) put(cpOwn, n, rec);
-  }
-
-  // PO line price maps — ascending id, so the latest purchase price wins.
-  const poExact = {}, poBase = {}, poBn = {};
-  let serviceSkipped = 0, cancelledSkipped = 0;
-  for (const r of pl.data) {
-    if (isServicePo(r.po_number)) { serviceSkipped++; continue; }
-    if (/cancel/i.test(String(r.line_status || ''))) { cancelledSkipped++; continue; }
-    const rec = { price: num(r.unit_price), po: r.line_ref || r.po_number || null };
-    put(poExact, normCode(r.internal_part_no), rec);
-    put(poBase, baseCode(r.internal_part_no), rec);
-    put(poBn, normCode(r.supplier_item_code), rec);
-  }
-
-  // BN number per stock code (stock_items.supplier_code), so a fastener
-  // whose BOM line carries its 1E1 code still finds a price captured
-  // against its BN number. Skipped quietly if stock_items can't be read.
-  const bnFor = {};
-  for (const r of (si.error ? [] : si.data)) {
-    const c = normCode(r.stock_code), bn = normCode(r.supplier_code);
-    if (c && bn && bn !== c && !bnFor[c]) bnFor[c] = bn;
-  }
-
-  const rows = bom.data.filter(r => r.storeroom !== 'STTE Store');
-  const byId = {}, hasKids = new Set();
-  for (const r of rows) {
-    if (r.component_id) byId[r.component_id] = r;
-    if (r.dependant_code) hasKids.add(r.dependant_code);
-  }
-
-  // Top-level sub-assembly a line rolls up to (the child of the root).
-  const topOf = r => {
-    let cur = r, guard = 0;
-    while (cur && cur.dependant_code && byId[cur.dependant_code] && byId[cur.dependant_code].dependant_code && guard++ < 20) {
-      cur = byId[cur.dependant_code];
+  // ── Pricing (_ensure_pricing_index / _get_all_prices) ──
+  const poProduct = new Map(sp.data.map(r => [r.po_number, r.product]));
+  const productOk = po => poProduct.get(po) === product;
+  const cpLatest = cp.data.slice().sort((a, b) =>
+    String(b.price_date || '').localeCompare(String(a.price_date || '')) || (b.id - a.id));
+  const priceCache = new Map();
+  const getPrice = (id, name, code, bn) => {
+    if (priceCache.has(id)) return priceCache.get(id);
+    let out = null;
+    const matches = [];
+    if (code) {
+      const prefix = code + '_';
+      for (const r of pl.data) {
+        const pn = r.internal_part_no || '';
+        if ((pn === code || pn.startsWith(prefix)) && productOk(r.po_number)) matches.push(r);
+      }
     }
-    if (!cur || !cur.dependant_code) return '(top level)';
-    if (cur === r) return '(fitted directly to the final assembly)';
-    return cur.item_name || cur.component_id || '(unnamed)';
+    if (name) {
+      const nu = name.trim().toUpperCase();
+      for (const r of pl.data) {
+        if (r.internal_part_no) continue;
+        if (String(r.description || '').trim().toUpperCase() === nu && productOk(r.po_number)) matches.push(r);
+      }
+    }
+    if (matches.length) {
+      const seen = new Map();
+      for (const r of matches) {
+        const pn = String(r.internal_part_no || '').trim();
+        const key = pn || `desc:${String(r.description || '').trim().toUpperCase()}`;
+        if (!seen.has(key) && num(r.unit_price) > 0) seen.set(key, r);
+      }
+      if (seen.size) {
+        const keys = [...seen.keys()].sort();
+        out = { price: [...seen.values()].reduce((s, r) => s + num(r.unit_price), 0),
+          source: keys.length > 1 ? `PO lines, ${keys.length} processes: ${keys.join(', ')}` : `PO line ${keys[0]}`,
+          from: keys.length > 1 ? 'Multiple' : seen.get(keys[0]).po_number };
+      }
+    }
+    if (!out && bn) {
+      const spec = BN_NORM(bn);
+      const m = cpLatest.find(r => BN_NORM(r.stock_code) === spec);
+      if (m) out = { price: num(m.unit_price), source: `BN spec match: ${m.item_name || ''}`, from: m.supplier || '' };
+    }
+    if (!out && id) {
+      const m = cpLatest.find(r => r.stock_item_id === id);
+      if (m) out = { price: num(m.unit_price), source: 'Pricing screen (stock item)', from: m.supplier || '' };
+    }
+    if (!out && name) {
+      const nu = name.trim().toUpperCase();
+      const m = cpLatest.find(r => String(r.item_name || '').trim().toUpperCase() === nu);
+      if (m) out = { price: num(m.unit_price), source: 'Pricing screen (item name)', from: m.supplier || '' };
+    }
+    priceCache.set(id, out);
+    return out;
   };
 
-  const SOURCES = ['Pricing screen (part no)', 'Pricing screen (base part no)', 'Pricing screen (BN number)',
-    'Pricing screen (item name)',
-    'PO price (part no)', 'PO price (base part no)', 'PO price (BN number)',
-    'Pricing screen (item name, other product)'];
-  const bySource = Object.fromEntries(SOURCES.map(s => [s, 0]));
-  const priced = [], unpriced = [], spread = [];
-  const bySub = {};
-  let total = 0;
-
-  for (const r of rows) {
-    if (r.build_status === 'CONTAINER') continue;
-    if (r.component_id && hasKids.has(r.component_id)) continue;   // assembly: its parts are costed
-    const qty = num(r[cfg.needCol]);
-    if (qty <= 0) continue;
-    const code = normCode(r.stock_code);
-    const base = baseCode(code);
-    const name = normName(r.item_name);
-    const bn = bnFor[code] || bnFor[base] || null;
-
-    const order = [[cpCode, code], [cpBase, base], [cpCode, bn], [cpOwn, name],
-                   [poExact, code], [poBase, base], [poBn, code], [poExact, bn], [cpAny, name]];
-    const srcIdx = [0, 1, 2, 3, 4, 5, 6, 6, 7];   // order entry → SOURCES label
-    let hit = null, source = null;
-    for (let i = 0; i < order.length; i++) {
-      const [map, k] = order[i];
-      if (k && map[k]) { hit = map[k]; source = SOURCES[srcIdx[i]]; break; }
+  // Why a part has no price — information only, never changes the total.
+  const whyUnpriced = (name, code, bn) => {
+    const nu = String(name || '').trim().toUpperCase();
+    const spec = bn ? BN_NORM(bn) : '';
+    const other = pl.data.filter(r => {
+      const pn = r.internal_part_no || '';
+      return num(r.unit_price) > 0 && (
+        (code && (pn === code || pn.startsWith(code + '_'))) ||
+        (spec && (BN_NORM(pn) === spec || BN_NORM(r.supplier_item_code) === spec)) ||
+        (!pn && nu && String(r.description || '').trim().toUpperCase() === nu));
+    });
+    if (other.length) {
+      const r = other[other.length - 1];
+      return `Bought on ${r.line_ref || r.po_number} (${poProduct.get(r.po_number) || 'product not set'}) at R${r2(num(r.unit_price))} — not an ${product} PO, so the costing ignores it.`;
     }
+    if (spec) {
+      const series = (String(bn).toUpperCase().match(/BN\s*\d+/) || [''])[0].replace(/\s+/g, '');
+      const near = series ? [...new Set(cpLatest.filter(r => BN_NORM(r.stock_code).startsWith(series))
+        .map(r => r.stock_code))].slice(0, 4) : [];
+      if (near.length) return `No price for ${bn}. The Pricing screen has other sizes of ${series} (${near.join('; ')}), not this one.`;
+    }
+    return 'No purchase order or Pricing screen record anywhere — probably opening stock never bought through Matrix. Capture its price once on the Pricing screen' + (bn ? ` against ${bn}.` : '.');
+  };
 
-    const sub = topOf(r);
-    if (!hit) {
-      unpriced.push({ item_name: r.item_name, stock_code: r.stock_code, storeroom: r.storeroom, qty_per_unit: qty, sub_assembly: sub });
+  // ── Root assembly ──
+  const inProduct = items.filter(r => (r.product || '') === product);
+  let root = null;
+  const wanted = String(assemblyArg || DEFAULT_ROOTS[product] || '').trim().toUpperCase();
+  if (wanted) {
+    const hits = inProduct.filter(r => String(r.item_name || '').trim().toUpperCase() === wanted)
+      .sort((a, b) => a.id - b.id);
+    root = hits.find(r => getBom(r.id).length) || hits[0] || null;
+    if (!root) {
+      const like = inProduct.filter(r => String(r.item_name || '').toUpperCase().includes(wanted)).slice(0, 15).map(r => r.item_name);
+      return { error: `No ${product} stock item named "${assemblyArg || DEFAULT_ROOTS[product]}".`, similar_names: like };
+    }
+  } else {
+    const roots = inProduct.filter(r => !String(r.dependant_code || '').trim() && getBom(r.id).length);
+    const complete = roots.filter(r => /COMPLETE/i.test(r.item_name || ''));
+    root = complete.length === 1 ? complete[0] : (roots.length === 1 ? roots[0] : null);
+    if (!root) return { error: `Several top-level ${product} assemblies — say which one.`,
+      candidates: roots.map(r => r.item_name).slice(0, 25) };
+  }
+
+  // ── Roll-up (_calc_assembly_cost), collecting leaves for the answer ──
+  const leaves = new Map();      // id -> {item_name, stock_code, qty, unit, source, from, sub}
+  const unpricedDeep = new Map();
+  const calc = (asmId, depth, mult, sub) => {
+    if (depth > 8) return 0;
+    let total = 0;
+    for (const r of getBom(asmId)) {
+      const q = num(r.qty_required) || 1;
+      if (getBom(r.id).length) { total += calc(r.id, depth + 1, mult * q, sub) * q; continue; }
+      const pr = getPrice(r.id, r.item_name, r.stock_code, r.supplier_code);
+      const key = r.id;
+      if (pr) {
+        total += pr.price * q;
+        const L = leaves.get(key) || { item_name: r.item_name, stock_code: r.stock_code, qty_per_unit: 0,
+          unit_price_excl_vat_zar: r2(pr.price), price_source: pr.source, from: pr.from || undefined, sub_assembly: sub };
+        L.qty_per_unit += mult * q; leaves.set(key, L);
+      } else {
+        const U = unpricedDeep.get(key) || { item_name: r.item_name, stock_code: r.stock_code, bn: r.supplier_code || undefined,
+          qty_per_unit: 0, sub_assembly: sub, why: whyUnpriced(r.item_name, r.stock_code, r.supplier_code) };
+        U.qty_per_unit += mult * q; unpricedDeep.set(key, U);
+      }
+    }
+    return total;
+  };
+
+  // Top level, as _recalculate()
+  const topLines = [];
+  let grand = 0, missingTop = 0;
+  const topBom = getBom(root.id);
+  for (const r of topBom) {
+    let id = r.id;
+    const match = (r.stock_code
+      ? inProduct.filter(a => a.stock_code === r.stock_code).sort((a, b) =>
+          String(a.item_name || '').localeCompare(String(b.item_name || '')) || a.id - b.id)[0]
+      : null) || inProduct.find(a => a.id === r.id);
+    if (match) id = match.id;
+    const q = (r.qty_required || 1);
+    if (getBom(id).length) {
+      const sub = calc(id, 1, q, r.item_name);
+      if (sub > 0) {
+        grand += sub * q;
+        topLines.push({ line: r.item_name, stock_code: r.stock_code, qty: q, kind: 'sub-assembly roll-up', unit_cost: vat3(sub), line_total: vat3(sub * q) });
+      } else {
+        missingTop++;
+        topLines.push({ line: r.item_name, stock_code: r.stock_code, qty: q, kind: 'sub-assembly', unit_cost: 'NOT PRICED' });
+      }
       continue;
     }
-    const lineCost = qty * hit.price;
-    total += lineCost;
-    bySource[source]++;
-    if (!bySub[sub]) bySub[sub] = { sub_assembly: sub, lines: 0, cost: 0 };
-    bySub[sub].lines++; bySub[sub].cost += lineCost;
-    priced.push({ item_name: r.item_name, stock_code: r.stock_code, sub_assembly: sub, qty_per_unit: qty,
-      unit_price_excl_vat_zar: r2(hit.price), line_cost_excl_vat_zar: r2(lineCost),
-      price_source: source, from: hit.po || undefined, invoice: hit.invoice || undefined,
-      price_date: hit.date || undefined });
-    if (hit.pos > 1 && hit.max > hit.min * 1.05) {
-      spread.push({ item_name: r.item_name, stock_code: r.stock_code, price_used: r2(hit.price),
-        lowest_on_file: r2(hit.min), highest_on_file: r2(hit.max), lines_on_file: hit.pos });
+    const pr = getPrice(id, r.item_name, r.stock_code, r.supplier_code);
+    if (!pr) {
+      missingTop++;
+      topLines.push({ line: r.item_name, stock_code: r.stock_code, qty: q, kind: 'component', unit_cost: 'NOT PRICED' });
+      unpricedDeep.set(id, { item_name: r.item_name, stock_code: r.stock_code, bn: r.supplier_code || undefined, qty_per_unit: q,
+        sub_assembly: '(final assembly)', why: whyUnpriced(r.item_name, r.stock_code, r.supplier_code) });
+      continue;
     }
+    grand += pr.price * q;
+    leaves.set(id, { item_name: r.item_name, stock_code: r.stock_code, qty_per_unit: q,
+      unit_price_excl_vat_zar: r2(pr.price), price_source: pr.source, from: pr.from || undefined, sub_assembly: '(final assembly)' });
+    topLines.push({ line: r.item_name, stock_code: r.stock_code, qty: q, kind: 'component', unit_cost: vat3(pr.price), line_total: vat3(pr.price * q), price_source: pr.source });
   }
 
   const cap = showAll ? 60 : 15;
-  priced.sort((a, b) => b.line_cost_excl_vat_zar - a.line_cost_excl_vat_zar);
-  spread.sort((a, b) => (b.highest_on_file - b.lowest_on_file) - (a.highest_on_file - a.lowest_on_file));
+  const leafList = [...leaves.values()].map(l => ({ ...l, qty_per_unit: r2(l.qty_per_unit),
+    line_cost_excl_vat_zar: r2(l.qty_per_unit * l.unit_price_excl_vat_zar) }))
+    .sort((a, b) => b.line_cost_excl_vat_zar - a.line_cost_excl_vat_zar);
+  const unpricedList = [...unpricedDeep.values()];
   const part = list => ({ shown: Math.min(list.length, cap), total: list.length, rows: list.slice(0, cap) });
-  const fromScreen = bySource[SOURCES[0]] + bySource[SOURCES[1]] + bySource[SOURCES[2]] + bySource[SOURCES[3]];
-  const byName = bySource[SOURCES[3]] + bySource[SOURCES[7]];
 
   return {
-    product: cfg.label,
-    value_type: 'ESTIMATED standard component cost per finished unit — latest captured price x BOM quantity. NOT actual project spend.',
-    component_cost_per_unit: vat3(total),
-    bom_lines_costed: priced.length + unpriced.length,
-    lines_priced: priced.length,
-    lines_without_price: unpriced.length,
-    price_sources_used: bySource,
-    cost_by_sub_assembly: Object.values(bySub).sort((a, b) => b.cost - a.cost).slice(0, 25)
-      .map(s => ({ sub_assembly: s.sub_assembly, lines: s.lines, ...vat3(s.cost) })),
-    costliest_lines: part(priced),
-    lines_without_price_list: part(unpriced),
-    parts_bought_at_different_prices: spread.length ? part(spread) : undefined,
-    excludes: 'Outside processing (LSO/ESO service POs), annealing, paint/sand, freight, labour and overheads. Component purchase price only.',
+    product,
+    assembly: root.item_name,
+    quantity: qtyBuild,
+    method: 'Same calculation as the Matrix Build Cost Calculator (frm_costing.py).',
+    value_type: 'ESTIMATED standard cost from captured prices x BOM quantity. NOT actual project spend.',
+    cost_per_unit: vat3(grand),
+    cost_for_quantity: qtyBuild > 1 ? vat3(grand * qtyBuild) : undefined,
+    screen_status: missingTop ? `${missingTop} top-level line(s) have missing prices` : 'All components fully priced',
+    top_level_lines: topLines,
+    costliest_parts: part(leafList),
+    parts_with_no_price_anywhere_in_tree: part(unpricedList),
     notes: [
-      unpriced.length ? `${unpriced.length} BOM line(s) have no price on file, so the total is UNDERSTATED by their cost.` : 'Every BOM line has a price on file.',
-      `Price = the latest record on the Component Pricing screen (${fromScreen} line(s)); where none is captured, the most recent purchase PO line, any project. Service POs and cancelled lines are ignored.`,
-      'Quantity per unit comes from the BOM readiness view; leaf lines only, so assemblies are not double counted. Parts unlinked in the BOM tree have no quantity per unit and are not costed.',
-      'PO prices exclude VAT, like all Matrix PO values.',
-      byName ? `${byName} line(s) were matched to a pricing record by item name only (no part number on the record) — check these.` : null,
-      'Pricing screen prices are the invoice unit price as captured; whether they exclude VAT is not confirmed.',
-      cfg.label === 'RLL' ? 'An RLL carries no sight unless specially requested, so no sight is included.' : null,
-      cpWarning
-    ].filter(Boolean),
-    pricing_records_read: { total: cpRows.length, with_part_number: cpLinked },
-    po_lines_ignored: { service_po_lines: serviceSkipped, cancelled_lines: cancelledSkipped }
+      'A part\'s price is the SUM of its process steps on PO lines (e.g. machining _M + surface treatment _T), only on POs for this product.',
+      'Fasteners without PO history are priced from the Component Pricing screen by BN spec.',
+      unpricedList.length ? `${unpricedList.length} part(s) deeper in the tree have no price and count as R0 — the screen does the same silently, so the total is understated by their cost.` : null,
+      'Labour, overheads and freight are not included.',
+      product === 'RLL' ? 'An RLL carries no sight unless specially requested.' : null,
+      build_items_note(bi)
+    ].filter(Boolean)
   };
 }
+const build_items_note = bi => bi.error ? `build_items could not be read (${bi.error}); its fallback BOMs were skipped.` : null;
 
 // ── 2026 400 RLL project tools ──────────────────────────────────────────────
 
@@ -2109,7 +2207,7 @@ async function runTool(name, input) {
   try {
     if (name === 'get_rll_shortfall')             return await get_rll_shortfall(input.qty || 1);
     if (name === 'get_grn40_shortfall')           return await get_grn40_shortfall(input.qty || 1);
-    if (name === 'get_unit_component_cost')       return await get_unit_component_cost(input.product, input.show_all === true);
+    if (name === 'get_unit_component_cost')       return await get_unit_component_cost(input.product, input.show_all === true, input.assembly, input.qty);
     if (name === 'get_rll_units_built')           return await get_rll_units_built();
     if (name === 'get_sub_builds_completed')      return await get_sub_builds_completed();
     if (name === 'get_sub_builds_hampering')      return await get_sub_builds_hampering();
