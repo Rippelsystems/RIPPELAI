@@ -5,7 +5,12 @@
 // 06-10-2026: added get_unit_component_cost — cost of one finished RLL,
 // GRN40 or XRGL40 (or a named sub-assembly), a direct port of the Matrix
 // Build Cost Calculator (frm_costing.py) so both give the same figure.
-// component_pricing added to the query_data sources. Nothing else changed.
+// component_pricing added to the query_data sources.
+//
+// 11-10-2026: added get_supplier_performance and get_time_lost (production
+// time: supplier on-time, QC turnaround, rejection loops, ESO/LSO turnaround,
+// and what is stuck now ranked by guns held). Read-only, no database change.
+// Nothing else changed.
 // ============================================================
 
 const { createClient } = require('@supabase/supabase-js');
@@ -70,6 +75,22 @@ COMPONENT COST PER UNIT:
   if the same question was answered earlier in this conversation. Prices
   and the BOM change during the day; never repeat figures from an earlier
   answer.
+
+TIME LOST AND SUPPLIER PERFORMANCE:
+- "Where are we losing time", "what is stuck", "how long has X been
+  waiting" -> get_time_lost (product defaults to RLL). Lead with the
+  summary by type, then the top items: what, where, how many days, how many
+  guns it represents, and whether the part is short for the build now.
+- "How is <supplier> performing", "which suppliers are late", "who has the
+  most rejections", "how long do external processes take" ->
+  get_supplier_performance. Give on-time %, average days late, open
+  overdue lines, delivery-to-QC days, rejection loops by attempt and days
+  lost, and service out-to-back days.
+- These are ACTUAL figures from recorded dates. Say so. Where a date is
+  missing (no committed date, no booking-in found) say it is missing —
+  never estimate it.
+- Build time per step is not planned in the system yet, so you can show how
+  long things actually took or have waited, not how long they should take.
 
 KEY PROJECT AND DEADLINE:
 - Project "2026 400 RLL": 400 RLL units must be DELIVERED by the end of
@@ -244,6 +265,36 @@ const TOOLS = [
       assembly: { type: 'string', description: 'Optional assembly item name, e.g. "FRONT GROUP". Defaults to the product\'s complete unit (RLL COMPLETE for RLL).' },
       qty:      { type: 'integer', description: 'Optional build quantity. Defaults to 1.' },
       show_all: { type: 'boolean', description: 'Set true when the person asks for all lines / the full list. Raises list caps from 15 to 60.' }
+    }}
+  },
+  {
+    name: 'get_supplier_performance',
+    description: 'Supplier and external-process performance: per supplier, '
+      + 'deliveries on time vs late (against the committed date) and average days '
+      + 'late, open PO lines past their committed date, delivery-to-QC turnaround '
+      + 'and items still awaiting QC, rejections by attempt (1st, 2nd, 3rd) with '
+      + 'days from rejection to accepted and open rejections, and ESO/LSO out-to-back '
+      + 'days with services still out. Worst suppliers first. Use for "how is JHPE '
+      + 'performing", "which suppliers are late", "who rejects most", "how long do '
+      + 'external processes take".',
+    input_schema: { type: 'object', properties: {
+      supplier:  { type: 'string', description: 'Optional supplier name (partial match).' },
+      days_back: { type: 'integer', description: 'Period to look back. Defaults to 180 days. Open items are always included.' },
+      show_all:  { type: 'boolean', description: 'Set true for the full supplier list (cap 60).' }
+    }}
+  },
+  {
+    name: 'get_time_lost',
+    description: 'What is stuck in production right now and for how long: parts '
+      + 'awaiting QC, out on ESO/LSO, open rejections, PO lines past their '
+      + 'committed date, and stock sitting in Holding Store — each with days '
+      + 'waiting, supplier, and how many complete guns the stuck quantity '
+      + 'represents. Parts that are short for the build come first. Use for '
+      + '"where are we losing time", "what is stuck", "what is holding up the '
+      + 'build", "how long has X been waiting".',
+    input_schema: { type: 'object', properties: {
+      product:  { type: 'string', description: 'RLL, GRN40 or XRGL40. Defaults to RLL.' },
+      show_all: { type: 'boolean', description: 'Set true for the full list (cap 60).' }
     }}
   },
   {
@@ -937,6 +988,326 @@ async function get_unit_component_cost(productArg, showAll, assemblyArg, qtyArg)
   };
 }
 const build_items_note = bi => bi.error ? `build_items could not be read (${bi.error}); its fallback BOMs were skipped.` : null;
+
+// ── Production time tools (11-10-2026) ──────────────────────────────────────
+// get_supplier_performance — per supplier: deliveries against committed date,
+//   delivery→QC turnaround, rejection loops and days lost, external service
+//   (ESO/LSO) turnaround. get_time_lost — what is stuck right now and for how
+//   long, ranked by how many guns of the product it represents.
+// Read-only. Every date comes from columns Matrix already records:
+//   po_lines (committed_date, qty_ordered/received, closed_date,
+//   written_off_date, line_status), supplier_po (supplier, committed_date,
+//   revised_date), po_deliveries (delivery_date, qc_completed_at, qc_status),
+//   rejection_tracking (rejection_date, accepted_date, date_resolved,
+//   attempt_no, status), service_orders (dispatched_date, returned_date,
+//   qty_outstanding, status), component_movements (movement_date, direction),
+//   stock_items (Holding Store rows).
+// Open/closed is decided by quantities first (received < ordered, qty
+// outstanding > 0); status text only excludes cancelled/closed rows and the
+// two values the reports already use ("Awaiting QC", "Resolved").
+
+const DAY_MS = 86400000;
+const saDate = v => {                         // any date/timestamp → 'YYYY-MM-DD' (SA)
+  if (!v) return null;
+  const s = String(v);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const t = new Date(s);
+  if (isNaN(t.getTime())) return null;
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Johannesburg' }).format(t);
+};
+const todaySA = () => saDate(new Date().toISOString());
+const dayDiff = (a, b) => {                   // b − a in whole days, SA dates
+  const x = saDate(a), y = saDate(b);
+  if (!x || !y) return null;
+  return Math.round((Date.parse(y + 'T00:00:00Z') - Date.parse(x + 'T00:00:00Z')) / DAY_MS);
+};
+const avg = arr => arr.length ? r2(arr.reduce((s, v) => s + v, 0) / arr.length) : null;
+const basePoNo = v => String(v || '').trim().split('/')[0].trim();
+const closedText = /(cancel|closed|written)/i;
+const partBase = c => String(c || '').trim().toUpperCase().split('_')[0].trim();
+
+// Line ref lookup with the batch fallback the integrity report uses
+// (POA31135-R/1-B1/B4 → POA31135-R/1-B1 → POA31135-R/1).
+function lineFinder(lines) {
+  const byRef = new Map();
+  for (const l of lines) { const k = String(l.line_ref || '').trim(); if (k && !byRef.has(k)) byRef.set(k, l); }
+  return ref => {
+    const r = String(ref || '').trim();
+    if (!r) return null;
+    for (const t of [r, r.replace(/\/B\d+$/i, ''), r.replace(/\/B\d+$/i, '').replace(/-B\d+$/i, ''), r.replace(/-B\d+$/i, '')]) {
+      if (byRef.has(t)) return byRef.get(t);
+    }
+    return null;
+  };
+}
+
+async function loadTimeData() {
+  return cached('time_data', 45000, async () => {
+    const [pl, sp, del, rej, so] = await Promise.all([
+      fetchAll('po_lines', 'id, po_number, line_ref, internal_part_no, description, qty_ordered, qty_received, committed_date, line_status, closed_date, written_off_date, stock_item_id', { order: 'id' }),
+      fetchAll('supplier_po', 'po_number, supplier, product, committed_date, revised_date', { order: 'po_number' }),
+      fetchAll('po_deliveries', 'id, po_number, line_ref, stock_item_id, delivery_date, qty_delivered, qty_passed_qc, qty_rejected, qc_status, qc_completed_at', { order: 'id' }),
+      fetchAll('rejection_tracking', '*', { order: 'id' }),
+      fetchAll('service_orders', '*', { order: 'id' })
+    ]);
+    for (const [n, r] of [['po_lines', pl], ['supplier_po', sp], ['po_deliveries', del], ['rejection_tracking', rej], ['service_orders', so]]) {
+      if (r.error) return { error: `${n}: ${r.error}` };
+    }
+    const header = new Map();
+    for (const h of sp.data) if (h.po_number && !header.has(h.po_number)) header.set(h.po_number, h);
+    const supplierOf = po => (header.get(basePoNo(po)) || {}).supplier || null;
+    const productOf = po => (header.get(basePoNo(po)) || {}).product || null;
+    return { lines: pl.data, header, supplierOf, productOf, findLine: lineFinder(pl.data),
+             deliveries: del.data, rejections: rej.data, services: so.data };
+  });
+}
+
+const supMatch = (name, q) => !q || String(name || '').toLowerCase().includes(String(q).toLowerCase());
+const committedFor = (line, hdr) => (line && line.committed_date) || (hdr && (hdr.revised_date || hdr.committed_date)) || null;
+
+async function get_supplier_performance(supplierArg, daysBackArg, showAll) {
+  const d = await loadTimeData();
+  if (d.error) return d;
+  const daysBack = Math.max(7, parseInt(daysBackArg) || 180);
+  const today = todaySA();
+  const from = saDate(new Date(Date.now() - daysBack * DAY_MS).toISOString());
+  const S = new Map();
+  const get = name => {
+    const k = name || 'Unknown supplier';
+    if (!S.has(k)) S.set(k, { supplier: k, deliveries: 0, on_time: 0, late: 0, no_date: 0, late_days: [],
+      qc_days: [], awaiting_qc: 0, awaiting_qc_oldest: 0, overdue_lines: 0, overdue_oldest_days: 0, overdue_value_qty: 0,
+      rej_count: 0, rej_qty: 0, rej_by_attempt: {}, rej_days: [], rej_open: 0, rej_open_oldest: 0,
+      svc_done_days: [], svc_open: 0, svc_open_oldest: 0, svc_open_qty: 0 });
+    return S.get(k);
+  };
+
+  // Deliveries: against committed date, and delivery → QC turnaround
+  for (const x of d.deliveries) {
+    const dd = saDate(x.delivery_date);
+    if (!dd || dd < from) continue;
+    const sup = d.supplierOf(x.po_number);
+    if (!supMatch(sup, supplierArg)) continue;
+    const s = get(sup);
+    s.deliveries++;
+    const line = d.findLine(x.line_ref);
+    const due = committedFor(line, d.header.get(basePoNo(x.po_number)));
+    if (!due) s.no_date++;
+    else {
+      const late = dayDiff(due, dd);
+      if (late > 0) { s.late++; s.late_days.push(late); } else s.on_time++;
+    }
+    if (x.qc_completed_at) { const q = dayDiff(dd, x.qc_completed_at); if (q != null && q >= 0) s.qc_days.push(q); }
+    else if (String(x.qc_status || '').trim() === 'Awaiting QC') {
+      s.awaiting_qc++; s.awaiting_qc_oldest = Math.max(s.awaiting_qc_oldest, dayDiff(dd, today) || 0);
+    }
+  }
+
+  // Open PO lines past their committed date (nothing or part received)
+  for (const l of d.lines) {
+    if (l.closed_date || l.written_off_date || closedText.test(String(l.line_status || ''))) continue;
+    if (num(l.qty_received) >= num(l.qty_ordered) || num(l.qty_ordered) <= 0) continue;
+    const due = committedFor(l, d.header.get(basePoNo(l.po_number)));
+    if (!due || due >= today) continue;
+    const sup = d.supplierOf(l.po_number);
+    if (!supMatch(sup, supplierArg)) continue;
+    const s = get(sup);
+    s.overdue_lines++; s.overdue_value_qty += num(l.qty_ordered) - num(l.qty_received);
+    s.overdue_oldest_days = Math.max(s.overdue_oldest_days, dayDiff(due, today));
+  }
+
+  // Rejections: loops per attempt and days from rejection to accepted/resolved
+  for (const r of d.rejections) {
+    const rd = saDate(r.rejection_date || r.created_at);
+    if (!rd) continue;
+    const sup = r.supplier || d.supplierOf(r.po_number || r.line_ref);
+    if (!supMatch(sup, supplierArg)) continue;
+    const open = String(r.status || '').trim() !== 'Resolved';
+    if (rd < from && !open) continue;
+    const s = get(sup);
+    s.rej_count++; s.rej_qty += num(r.qty_rejected);
+    const a = num(r.attempt_no) > 1 ? `attempt ${num(r.attempt_no)}` : 'attempt 1';
+    s.rej_by_attempt[a] = (s.rej_by_attempt[a] || 0) + 1;
+    const end = r.accepted_date || r.date_resolved;
+    if (end) { const n = dayDiff(rd, end); if (n != null && n >= 0) s.rej_days.push(n); }
+    if (open) { s.rej_open++; s.rej_open_oldest = Math.max(s.rej_open_oldest, dayDiff(rd, today) || 0); }
+  }
+
+  // External services (ESO / LSO): out → back
+  for (const o of d.services) {
+    const out = saDate(o.dispatched_date);
+    if (!out) continue;
+    const sup = o.supplier || d.supplierOf(o.po_number || o.line_ref);
+    if (!supMatch(sup, supplierArg)) continue;
+    const open = num(o.qty_outstanding) > 0 && !/cancel/i.test(String(o.status || ''));
+    if (out < from && !open) continue;
+    const s = get(sup);
+    if (o.returned_date) { const n = dayDiff(out, o.returned_date); if (n != null && n >= 0) s.svc_done_days.push(n); }
+    if (open) { s.svc_open++; s.svc_open_qty += num(o.qty_outstanding); s.svc_open_oldest = Math.max(s.svc_open_oldest, dayDiff(out, today) || 0); }
+  }
+
+  const rows = [...S.values()].map(s => ({
+    supplier: s.supplier,
+    deliveries: s.deliveries,
+    on_time_pct: (s.on_time + s.late) ? Math.round(s.on_time / (s.on_time + s.late) * 100) : null,
+    late_deliveries: s.late, avg_days_late: avg(s.late_days), deliveries_without_committed_date: s.no_date || undefined,
+    overdue_open_lines: s.overdue_lines || undefined, overdue_qty: s.overdue_value_qty || undefined,
+    oldest_overdue_days: s.overdue_lines ? s.overdue_oldest_days : undefined,
+    avg_days_delivery_to_qc: avg(s.qc_days), awaiting_qc: s.awaiting_qc || undefined,
+    oldest_awaiting_qc_days: s.awaiting_qc ? s.awaiting_qc_oldest : undefined,
+    rejections: s.rej_count || undefined, rejected_qty: s.rej_qty || undefined,
+    rejections_by_attempt: s.rej_count ? s.rej_by_attempt : undefined,
+    avg_days_rejection_to_accepted: avg(s.rej_days), open_rejections: s.rej_open || undefined,
+    oldest_open_rejection_days: s.rej_open ? s.rej_open_oldest : undefined,
+    avg_days_service_out_to_back: avg(s.svc_done_days), services_still_out: s.svc_open || undefined,
+    service_qty_still_out: s.svc_open_qty || undefined, oldest_service_out_days: s.svc_open ? s.svc_open_oldest : undefined,
+    _score: s.late + s.overdue_lines * 2 + s.rej_open * 2 + s.svc_open + s.awaiting_qc
+  })).filter(r => r.deliveries || r.overdue_open_lines || r.rejections || r.services_still_out || r.avg_days_service_out_to_back != null);
+  rows.sort((a, b) => b._score - a._score);
+  for (const r of rows) delete r._score;
+  if (!rows.length) return { error: supplierArg ? `No activity found for a supplier matching "${supplierArg}" in the last ${daysBack} days.` : 'No supplier activity found.' };
+  const cap = supplierArg ? 10 : (showAll ? 60 : 15);
+  return {
+    period: `${from} to ${today} (${daysBack} days)`,
+    filter: supplierArg || 'all suppliers, worst first',
+    shown: Math.min(rows.length, cap), total: rows.length,
+    suppliers: rows.slice(0, cap),
+    basis: [
+      'Late = delivery date after the PO line\'s committed date (else the PO header\'s revised, else committed date).',
+      'Delivery→QC = delivery date to QC completed date. Rejection days = rejection date to accepted (else resolved) date.',
+      'Service out→back = ESO/LSO dispatched to returned date. Open items are counted whatever their age.',
+      'Supplier comes from the PO header; rejection records use their own supplier when set.'
+    ]
+  };
+}
+
+async function get_time_lost(productArg, showAll) {
+  const p = String(productArg || 'RLL').toUpperCase().replace(/\s+/g, '');
+  const product = p === 'GRN' ? 'GRN40' : (p === 'XRGL' ? 'XRGL40' : p);
+  const view = product === 'RLL' ? { v: 'v_rll_build_readiness', need: 'need_for_1_rll' }
+            : product === 'GRN40' ? { v: 'v_grn40_build_readiness', need: 'need_for_1_grn40' } : null;
+
+  const d = await loadTimeData();
+  if (d.error) return d;
+  const today = todaySA();
+
+  // Parts of this product: per-gun quantity and current shortage (from the
+  // BOM readiness view). XRGL40 has no readiness view — every item is listed
+  // without a guns figure.
+  const perGun = new Map(), shortNow = new Set();
+  let bomNote = null;
+  let target = null;
+  if (product === 'RLL') {
+    const pr = await supabase.from('projects').select('target_qty').eq('project_name', PROJECT_400).limit(1);
+    target = targetFromProject(pr);
+  }
+  if (view) {
+    const bom = await fetchAll(view.v, `stock_code, item_name, available_qty, holding_qty, on_order_qty, build_status, ${view.need}`, { order: 'stock_code' });
+    if (bom.error) bomNote = `BOM view could not be read (${bom.error}); guns figure not available.`;
+    else for (const r of bom.data) {
+      if (r.build_status === 'CONTAINER') continue;
+      const k = partBase(r.stock_code), q = num(r[view.need]);
+      if (!k || q <= 0) continue;
+      perGun.set(k, (perGun.get(k) || 0) + q);
+      if (target && num(r.available_qty) < q * target) shortNow.add(k);
+    }
+  } else bomNote = 'XRGL40 has no BOM readiness view the assistant can read — items are listed without a "guns held" figure and are not limited to XRGL40 parts.';
+
+  const inProduct = (code, po) => view ? perGun.has(partBase(code)) : (!po || d.productOf(po) === product || !d.productOf(po));
+  const guns = (code, qty) => { const g = perGun.get(partBase(code)); return g ? Math.floor(num(qty) / g) : null; };
+  const items = [];
+  const add = (kind, o) => items.push({ kind, ...o, guns_held: guns(o.part, o.qty), part_short_now: target ? shortNow.has(partBase(o.part)) : undefined });
+
+  // 1. Awaiting QC
+  for (const x of d.deliveries) {
+    if (String(x.qc_status || '').trim() !== 'Awaiting QC' || x.qc_completed_at) continue;
+    const line = d.findLine(x.line_ref);
+    const part = line && line.internal_part_no;
+    if (!inProduct(part, x.po_number)) continue;
+    add('Awaiting QC', { part: part || null, item: line && line.description, ref: x.line_ref || x.po_number,
+      supplier: d.supplierOf(x.po_number), qty: num(x.qty_delivered), days: dayDiff(x.delivery_date, today) });
+  }
+  // 2. Out on external service
+  for (const o of d.services) {
+    if (!(num(o.qty_outstanding) > 0) || /cancel/i.test(String(o.status || ''))) continue;
+    const line = d.findLine(o.line_ref);
+    const part = (line && line.internal_part_no) || o.part_number || o.stock_code || null;
+    if (!inProduct(part, o.po_number)) continue;
+    add('Out on service (ESO/LSO)', { part, item: (line && line.description) || o.item_name || o.description, ref: o.so_number || o.eso_number || o.line_ref || o.po_number,
+      supplier: o.supplier || d.supplierOf(o.po_number || o.line_ref), qty: num(o.qty_outstanding), days: dayDiff(o.dispatched_date || o.raised_date, today) });
+  }
+  // 3. Open rejections
+  for (const r of d.rejections) {
+    if (String(r.status || '').trim() === 'Resolved') continue;
+    const part = r.stock_code || ((d.findLine(r.line_ref || r.po_number) || {}).internal_part_no) || null;
+    if (!inProduct(part, r.po_number)) continue;
+    add('Open rejection', { part, item: r.item_name, ref: r.rn_number || r.line_ref || r.po_number, supplier: r.supplier || d.supplierOf(r.po_number || r.line_ref),
+      qty: num(r.return_expected_qty) || num(r.qty_rejected), days: dayDiff(r.rejection_date || r.created_at, today),
+      status: r.status || undefined, attempt: num(r.attempt_no) > 1 ? num(r.attempt_no) : undefined });
+  }
+  // 4. PO lines past committed date, not fully received
+  for (const l of d.lines) {
+    if (l.closed_date || l.written_off_date || closedText.test(String(l.line_status || ''))) continue;
+    const outQty = num(l.qty_ordered) - num(l.qty_received);
+    if (outQty <= 0) continue;
+    const due = committedFor(l, d.header.get(basePoNo(l.po_number)));
+    if (!due || due >= today) continue;
+    if (!inProduct(l.internal_part_no, l.po_number)) continue;
+    add('Overdue from supplier', { part: l.internal_part_no, item: l.description, ref: l.line_ref || l.po_number,
+      supplier: d.supplierOf(l.po_number), qty: outQty, days: dayDiff(due, today), committed: due });
+  }
+  // 5. Sitting in Holding Store (days since last booked in)
+  const hs = await fetchAll('stock_items', 'id, item_name, stock_code, stock_qty, product, storeroom', { order: 'id',
+    mod: q => q.eq('storeroom', 'Holding Store').gt('stock_qty', 0) });
+  let holdNote = null;
+  if (hs.error) holdNote = `Holding Store could not be read (${hs.error}).`;
+  else {
+    const rowsH = hs.data.filter(r => view ? perGun.has(partBase(r.stock_code)) : (r.product || '') === product);
+    const ids = rowsH.map(r => r.id);
+    const lastIn = new Map();
+    for (let i = 0; i < ids.length; i += 200) {
+      const mv = await fetchAll('component_movements', 'stock_item_id, movement_date, direction', { order: 'stock_item_id',
+        mod: q => q.in('stock_item_id', ids.slice(i, i + 200)) });
+      if (mv.error) { holdNote = `Movement history could not be read (${mv.error}).`; break; }
+      for (const m of mv.data) {
+        if (!/^(IN|RETURN)/i.test(String(m.direction || ''))) continue;
+        const t = saDate(m.movement_date);
+        if (t && (!lastIn.has(m.stock_item_id) || t > lastIn.get(m.stock_item_id))) lastIn.set(m.stock_item_id, t);
+      }
+    }
+    for (const r of rowsH) {
+      const t = lastIn.get(r.id);
+      add('In Holding Store', { part: r.stock_code, item: r.item_name, ref: r.stock_code, qty: num(r.stock_qty),
+        days: t ? dayDiff(t, today) : null, since: t || 'no booking-in found' });
+    }
+  }
+
+  // Rank: guns held (short parts first), then days waiting
+  items.sort((a, b) => (Number(b.part_short_now || 0) - Number(a.part_short_now || 0))
+    || ((b.guns_held || 0) - (a.guns_held || 0)) || ((b.days || 0) - (a.days || 0)));
+  const byKind = {};
+  for (const it of items) {
+    const k = byKind[it.kind] || (byKind[it.kind] = { items: 0, qty: 0, oldest_days: 0, on_short_parts: 0 });
+    k.items++; k.qty += it.qty || 0; k.oldest_days = Math.max(k.oldest_days, it.days || 0);
+    if (it.part_short_now) k.on_short_parts++;
+  }
+  const cap = showAll ? 60 : 20;
+  return {
+    product, as_at: today,
+    deadline: product === 'RLL' ? DEADLINE_400 : undefined,
+    days_to_deadline: product === 'RLL' ? daysUntil(DEADLINE_400) : undefined,
+    summary_by_type: byKind,
+    shown: Math.min(items.length, cap), total: items.length,
+    stuck_items: items.slice(0, cap),
+    ranking: 'Parts that are short for the build right now come first, then the most guns held, then the longest wait.',
+    notes: [
+      'guns_held = quantity stuck ÷ quantity per finished unit from the BOM — the number of complete guns that quantity represents.',
+      target ? `part_short_now = shelf stock of that part is below what ${target} guns need (${PROJECT_400} target).` : 'part_short_now is only worked out for the RLL (project target known).',
+      'In Holding Store: days since the row was last booked in (a lower bound — part of the quantity may have waited longer).',
+      'Overdue from supplier: days past the committed date (PO line, else PO header revised/committed date).',
+      bomNote, holdNote
+    ].filter(Boolean)
+  };
+}
 
 // ── 2026 400 RLL project tools ──────────────────────────────────────────────
 
@@ -2208,6 +2579,8 @@ async function runTool(name, input) {
     if (name === 'get_rll_shortfall')             return await get_rll_shortfall(input.qty || 1);
     if (name === 'get_grn40_shortfall')           return await get_grn40_shortfall(input.qty || 1);
     if (name === 'get_unit_component_cost')       return await get_unit_component_cost(input.product, input.show_all === true, input.assembly, input.qty);
+    if (name === 'get_supplier_performance')      return await get_supplier_performance(input.supplier, input.days_back, input.show_all === true);
+    if (name === 'get_time_lost')                 return await get_time_lost(input.product, input.show_all === true);
     if (name === 'get_rll_units_built')           return await get_rll_units_built();
     if (name === 'get_sub_builds_completed')      return await get_sub_builds_completed();
     if (name === 'get_sub_builds_hampering')      return await get_sub_builds_hampering();
