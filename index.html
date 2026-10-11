@@ -103,6 +103,13 @@
     cursor: pointer;
   }
   .clear-btn:hover { background: rgba(255,255,255,0.15); }
+  .user-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.15);
+    padding: 5px 10px; border-radius: 20px; font-size: 12px; cursor: pointer;
+  }
+  .user-chip:hover { background: rgba(255,255,255,0.15); }
 
   #chat {
     flex: 1;
@@ -206,6 +213,19 @@
   </div>
 
   <div class="sidebar-section">
+    <div class="sidebar-label">PRODUCTION TIME</div>
+    <div class="sidebar-item" onclick="quickAsk('Where are we losing time on the 400 RLL?')">
+      <span class="sidebar-icon">⏱️</span> Where are we losing time?
+    </div>
+    <div class="sidebar-item" onclick="quickAsk('What changed since yesterday?')">
+      <span class="sidebar-icon">🔄</span> What changed since yesterday?
+    </div>
+    <div class="sidebar-item" onclick="quickAsk('Which suppliers are performing worst over the last 90 days?')">
+      <span class="sidebar-icon">🚚</span> Supplier performance
+    </div>
+  </div>
+
+  <div class="sidebar-section">
     <div class="sidebar-label">FINANCIAL</div>
     <div class="sidebar-item" onclick="quickAsk('What is our total open PO value right now?')">
       <span class="sidebar-icon">📋</span> Total open PO value
@@ -233,7 +253,7 @@
 
   <div class="status-card">
     <strong>Phase 2 — Live data</strong>
-    Connected to LIVE Supabase. Read only.
+    Connected to LIVE Supabase. Reads Matrix only — never changes it. Questions are logged with your name.
   </div>
 </div>
 
@@ -247,6 +267,7 @@
       </div>
     </div>
     <div class="header-right">
+      <span class="user-chip" id="userChip" onclick="askName(true)" title="Change name">👤 <span id="userName">—</span></span>
       <span class="live-dot"><span class="dot"></span> Live data</span>
       <button class="clear-btn" onclick="clearChat()">Clear chat</button>
     </div>
@@ -270,6 +291,27 @@
   const input = document.getElementById('input');
 
   let messages = [];
+
+  // ---- Who is asking (11-10-2026): asked once, kept on this computer, sent
+  // with every question so the bot's question log shows who asked what.
+  // This identifies the user for the log; it is not a password or a login.
+  const NAME_KEY = 'rippelbot_user';
+  let userName = '';
+  function loadName() {
+    try { userName = (localStorage.getItem(NAME_KEY) || '').trim(); } catch (e) { userName = ''; }
+    document.getElementById('userName').textContent = userName || 'Set your name';
+  }
+  function askName(force) {
+    if (userName && !force) return userName;
+    const v = (window.prompt('Your name (shown in the question log):', userName || '') || '').trim();
+    if (v) {
+      userName = v.slice(0, 80);
+      try { localStorage.setItem(NAME_KEY, userName); } catch (e) { /* private window — kept for this visit only */ }
+    }
+    document.getElementById('userName').textContent = userName || 'Set your name';
+    return userName;
+  }
+  loadName();
 
   // Very small markdown-ish renderer: tables, bold, headings, bullets
   function renderMarkdown(text) {
@@ -437,6 +479,7 @@
     e.preventDefault();
     const text = input.value.trim();
     if (!text) return;
+    if (!userName) askName(false);
 
     addRow('user', text);
     messages.push({ role: 'user', content: text });
@@ -449,7 +492,7 @@
       const res = await fetch('/.netlify/functions/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages })
+        body: JSON.stringify({ messages, user: userName || null })
       });
       const data = await res.json();
 
