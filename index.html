@@ -475,6 +475,88 @@
     chatEl.innerHTML = '';
   }
 
+  // ---- Asking (11-10-2026): questions run in the background (up to ~5 min)
+  // through chat-background; this page checks chat {mode:"status"} every 2 s.
+  // If the background function cannot be reached it falls back to a direct
+  // answer within 30 s.
+  function newJobId() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+      const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+    });
+  }
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  function showReply(loadingBubble, question, data) {
+    const textBlock = (data.content || []).find(b => b.type === 'text');
+    const replyText = textBlock ? textBlock.text : (data.error || 'No response received.');
+    loadingBubble.innerHTML = renderMarkdown(replyText);
+    loadingBubble.classList.remove('loading');
+    if (textBlock) {
+      addActions(loadingBubble.parentElement, question, replyText);
+      messages.push({ role: 'assistant', content: data.content });
+    } else {
+      messages.pop();   // no answer — keep the conversation clean
+    }
+  }
+
+  function showFailure(loadingBubble, text) {
+    messages.pop();
+    loadingBubble.innerHTML = renderMarkdown(text);
+    loadingBubble.classList.remove('loading');
+  }
+
+  async function askDirect(loadingBubble, question) {
+    const res = await fetch('/.netlify/functions/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages, user: userName || null })
+    });
+    const raw = await res.text();
+    let data;
+    try { data = JSON.parse(raw); }
+    catch (pe) {
+      return showFailure(loadingBubble, '**The bot ran out of time on that question** (server reply ' + res.status +
+        '). Please split it into two questions.');
+    }
+    showReply(loadingBubble, question, data);
+  }
+
+  async function askInBackground(loadingBubble, question) {
+    const jobId = newJobId();
+    let accepted = false;
+    try {
+      const r = await fetch('/.netlify/functions/chat-background', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_id: jobId, messages, user: userName || null })
+      });
+      accepted = r.status === 202 || r.ok;
+    } catch (e) { accepted = false; }
+    if (!accepted) return false;
+
+    const t0 = Date.now();
+    const LIMIT_MS = 330000;            // the background run stops itself at ~4 min 50 s
+    while (Date.now() - t0 < LIMIT_MS) {
+      await sleep(2000);
+      const secs = Math.round((Date.now() - t0) / 1000);
+      loadingBubble.textContent = 'Researching… ' + secs + ' s';
+      let st;
+      try {
+        const r = await fetch('/.netlify/functions/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode: 'status', job_id: jobId })
+        });
+        st = await r.json();
+      } catch (e) { continue; }          // a missed check is fine — try again in 2 s
+      if (st.status === 'done' && st.result) { showReply(loadingBubble, question, st.result); return true; }
+      if (st.status === 'error') { showFailure(loadingBubble, '**The bot could not finish that question.** ' + (st.error || '') ); return true; }
+    }
+    showFailure(loadingBubble, '**No answer after 5 minutes.** Please try again, or split the question.');
+    return true;
+  }
+
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const text = input.value.trim();
@@ -489,25 +571,10 @@
     loadingBubble.classList.add('loading');
 
     try {
-      const res = await fetch('/.netlify/functions/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages, user: userName || null })
-      });
-      const data = await res.json();
-
-      const textBlock = (data.content || []).find(b => b.type === 'text');
-      const replyText = textBlock ? textBlock.text : (data.error || 'No response received.');
-
-      loadingBubble.innerHTML = renderMarkdown(replyText);
-      loadingBubble.classList.remove('loading');
-      if (textBlock) addActions(loadingBubble.parentElement, text, replyText);
-
-      messages.push({ role: 'assistant', content: data.content });
-
+      const handled = await askInBackground(loadingBubble, text);
+      if (!handled) await askDirect(loadingBubble, text);
     } catch (err) {
-      loadingBubble.textContent = 'Error: ' + err.message;
-      loadingBubble.classList.remove('loading');
+      showFailure(loadingBubble, 'Error: ' + err.message);
     }
   });
 </script>
