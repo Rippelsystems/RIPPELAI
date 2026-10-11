@@ -10,7 +10,26 @@
 // 11-10-2026: added get_supplier_performance and get_time_lost (production
 // time: supplier on-time, QC turnaround, rejection loops, ESO/LSO turnaround,
 // and what is stuck now ranked by guns held). Read-only, no database change.
-// Nothing else changed.
+//
+// 11-10-2026 (steps 2-5):
+//   2  every tool result carries _meta (sources + time read); answers end
+//      with "Source: … · data as at …" and a "Gaps:" line when data is missing.
+//   3  Admin mode "tool" (header x-bot-secret = BOT_ADMIN_SECRET) returns one
+//      tool's raw result — used by the acceptance test runner.
+//      get_supplier_performance gains uncapped "overall" totals.
+//   4  Admin mode "snapshot" saves the day's key figures to
+//      production_snapshots; new tool get_changes compares two days.
+//   5  every chat turn is written to bot_question_log (who, question, tools,
+//      answer, outcome). The only writes this function makes are to those two
+//      tables.
+//   11-10-2026 13:40: time budget 52 s → 26 s (Netlify cuts this site off at
+//      30 s with a 504).
+//   11-10-2026 14:00: the conversation loop moved into runConversation(),
+//      shared with the new chat-background.js (Netlify Background Function,
+//      up to 5 min per question). New mode "status" returns a background
+//      question's progress/answer from public.bot_jobs. Prompt caching on the
+//      instructions and tool list. Direct answers (26 s) still work as a
+//      fallback. Tools and rules unchanged.
 // ============================================================
 
 const { createClient } = require('@supabase/supabase-js');
@@ -18,6 +37,7 @@ const { createClient } = require('@supabase/supabase-js');
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const SUPABASE_URL      = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const BOT_ADMIN_SECRET  = process.env.BOT_ADMIN_SECRET || '';   // Admin modes: snapshot + tool tests
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const VAT_RATE = 0.15;
@@ -75,6 +95,12 @@ COMPONENT COST PER UNIT:
   if the same question was answered earlier in this conversation. Prices
   and the BOM change during the day; never repeat figures from an earlier
   answer.
+
+WHAT CHANGED:
+- "What changed since yesterday / last week", "are we getting better or
+  worse", "what is new" -> get_changes (days_back 1 for yesterday, 7 for a
+  week). Lead with what got worse, then what got better, then newly stuck
+  and cleared items. Snapshots are daily — say so if asked about today.
 
 TIME LOST AND SUPPLIER PERFORMANCE:
 - "Where are we losing time", "what is stuck", "how long has X been
@@ -199,6 +225,15 @@ FINANCE / PO RULES (permanent business knowledge):
   are empty). Never state profit, margin or budget remaining for a project
   until a tool returns real values. Say the data has not been captured yet.
 
+SOURCE AND TIME ON EVERY ANSWER:
+- Every tool result has _meta with sources (plain names) and data_read_at.
+  End every answer that uses tool data with ONE short line:
+  "Source: <sources> · data as at <data_read_at>".
+- If a result reports missing, conflicting or partial data (notes, missing
+  dates, unpriced parts, capped lists, unreadable tables), add ONE line
+  starting "Gaps:" that says what is missing. Never leave it out to make an
+  answer look complete.
+
 Never guess. Always call the appropriate tool. Always state currency as
 R (ZAR). Be concise and direct — these are busy operational stakeholders.
 
@@ -295,6 +330,18 @@ const TOOLS = [
     input_schema: { type: 'object', properties: {
       product:  { type: 'string', description: 'RLL, GRN40 or XRGL40. Defaults to RLL.' },
       show_all: { type: 'boolean', description: 'Set true for the full list (cap 60).' }
+    }}
+  },
+  {
+    name: 'get_changes',
+    description: 'What has changed in production between two daily snapshots: '
+      + 'guns assembled, sub-builds completed, parts not ordered, overdue PO '
+      + 'lines, awaiting QC, open rejections, ESO/LSO out, supplier on-time %, '
+      + 'and which stuck items are new or cleared. Use for "what changed since '
+      + 'yesterday / last week", "are we getting better or worse", "what is new".',
+    input_schema: { type: 'object', properties: {
+      product:   { type: 'string', description: 'RLL, GRN40 or XRGL40. Defaults to RLL.' },
+      days_back: { type: 'integer', description: 'Compare the latest snapshot with the one this many days earlier. Defaults to 1 (yesterday). Use 7 for "this week".' }
     }}
   },
   {
@@ -1166,8 +1213,18 @@ async function get_supplier_performance(supplierArg, daysBackArg, showAll) {
   for (const r of rows) delete r._score;
   if (!rows.length) return { error: supplierArg ? `No activity found for a supplier matching "${supplierArg}" in the last ${daysBack} days.` : 'No supplier activity found.' };
   const cap = supplierArg ? 10 : (showAll ? 60 : 15);
+  // Totals over ALL suppliers (not capped) — used by the acceptance tests
+  // and the daily snapshot.
+  const all = [...S.values()];
+  const sumK = k => all.reduce((t, x) => t + (Array.isArray(x[k]) ? x[k].length : num(x[k])), 0);
+  const onT = sumK('on_time'), lateT = sumK('late');
+  const overall = { suppliers: rows.length, deliveries: sumK('deliveries'),
+    on_time_pct: (onT + lateT) ? Math.round(onT / (onT + lateT) * 100) : null, late_deliveries: lateT,
+    overdue_open_lines: sumK('overdue_lines'), awaiting_qc: sumK('awaiting_qc'),
+    rejections: sumK('rej_count'), open_rejections: sumK('rej_open'), services_still_out: sumK('svc_open') };
   return {
     period: `${from} to ${today} (${daysBack} days)`,
+    overall,
     filter: supplierArg || 'all suppliers, worst first',
     shown: Math.min(rows.length, cap), total: rows.length,
     suppliers: rows.slice(0, cap),
@@ -1306,6 +1363,126 @@ async function get_time_lost(productArg, showAll) {
       'Overdue from supplier: days past the committed date (PO line, else PO header revised/committed date).',
       bomNote, holdNote
     ].filter(Boolean)
+  };
+}
+
+// ── Step 4 (11-10-2026): daily production snapshot + "what changed" ─────────
+// Once a day (pg_cron → this function, mode "snapshot") the key production
+// figures are worked out with the SAME tools the bot answers with, and kept
+// as one row per day per product in public.production_snapshots. get_changes
+// compares two of those rows. Nothing is estimated: a figure a tool could not
+// produce is stored as null and reported as missing.
+
+async function buildSnapshot(product) {
+  const p = (product || 'RLL').toUpperCase();
+  const fig = {}, gaps = [];
+  const take = (label, fn) => fn().catch(e => ({ error: e.message })).then(r => {
+    if (r && r.error) gaps.push(`${label}: ${r.error}`);
+    return r || {};
+  });
+  const [built, subs, risk, lost, sup] = await Promise.all([
+    p === 'RLL' ? take('units built', () => get_rll_units_built()) : Promise.resolve({}),
+    p === 'RLL' ? take('sub-builds', () => get_sub_builds_completed()) : Promise.resolve({}),
+    p === 'RLL' ? take('deadline risk', () => get_rll_deadline_risk()) : Promise.resolve({}),
+    take('time lost', () => get_time_lost(p, true)),
+    take('supplier performance', () => get_supplier_performance(null, 30, true))
+  ]);
+  const st = (built.step_1_assembled_per_production_progress) || {};
+  if (st.error) gaps.push(`units built: ${st.error}`);
+  fig.guns_assembled = st.guns_assembled_in_stock ?? null;
+  fig.buildable_now = st.buildable_now_from_shelf_stock ?? null;
+  fig.secured_incl_process_and_on_order = st.secured_incl_process_and_on_order ?? null;
+  fig.assembly_completion_pct = st.assembly_completion_pct ?? null;
+  fig.lines_needing_sourcing = st.lines_needing_sourcing ?? null;
+  fig.target = st.target ?? null;
+  fig.sub_builds_completed = subs.completed ?? null;
+  fig.sub_builds_partly = subs.partly_built ?? null;
+  fig.sub_builds_not_started = subs.not_started ?? null;
+  const rs = risk.summary || {};
+  fig.parts_not_ordered = rs.not_ordered_parts ?? null;
+  fig.parts_partly_ordered = rs.partly_ordered_parts ?? null;
+  fig.parts_on_order_date_risk = rs.on_order_but_date_risk ?? null;
+  const lk = lost.summary_by_type || {};
+  for (const [k, v] of Object.entries(lk)) {
+    const key = 'stuck_' + k.toLowerCase().replace(/[^a-z]+/g, '_').replace(/^_|_$/g, '');
+    fig[key + '_items'] = v.items; fig[key + '_qty'] = v.qty; fig[key + '_oldest_days'] = v.oldest_days;
+  }
+  const ov = sup.overall || {};
+  fig.suppliers_on_time_pct_30d = ov.on_time_pct ?? null;
+  fig.overdue_open_po_lines = ov.overdue_open_lines ?? null;
+  fig.awaiting_qc = ov.awaiting_qc ?? null;
+  fig.open_rejections = ov.open_rejections ?? null;
+  fig.services_still_out = ov.services_still_out ?? null;
+  const stuck = (lost.stuck_items || []).slice(0, 60).map(i => ({ kind: i.kind, ref: i.ref, part: i.part,
+    item: i.item, qty: i.qty, days: i.days, guns_held: i.guns_held, short: i.part_short_now }));
+  return { product: p, figures: fig, stuck_items: stuck, gaps };
+}
+
+async function saveSnapshot(product) {
+  const snap = await buildSnapshot(product);
+  const today = todaySA();
+  const row = { snapshot_date: today, product: snap.product, figures: snap.figures,
+    stuck_items: snap.stuck_items, gaps: snap.gaps, taken_at: new Date().toISOString() };
+  const { error } = await supabase.from('production_snapshots').upsert(row, { onConflict: 'snapshot_date,product' });
+  if (error) return { ok: false, error: `production_snapshots: ${error.message}` };
+  return { ok: true, snapshot_date: today, product: snap.product, figures: Object.keys(snap.figures).length, gaps: snap.gaps };
+}
+
+const FIG_LABELS = {
+  guns_assembled: 'Guns assembled', buildable_now: 'Guns buildable now from shelf stock',
+  secured_incl_process_and_on_order: 'Guns secured (incl. in process + on order)',
+  assembly_completion_pct: 'Assembly completion %', lines_needing_sourcing: 'BOM lines needing sourcing',
+  sub_builds_completed: 'Sub-builds completed', sub_builds_partly: 'Sub-builds partly built',
+  sub_builds_not_started: 'Sub-builds not started', parts_not_ordered: 'Parts not ordered',
+  parts_partly_ordered: 'Parts partly ordered', parts_on_order_date_risk: 'Parts on order with a date risk',
+  suppliers_on_time_pct_30d: 'Supplier on-time % (30 days)', overdue_open_po_lines: 'Overdue open PO lines',
+  awaiting_qc: 'Deliveries awaiting QC', open_rejections: 'Open rejections', services_still_out: 'ESO/LSO still out'
+};
+// For these a RISE is good; for everything else a rise is bad.
+const UP_IS_GOOD = new Set(['guns_assembled', 'buildable_now', 'secured_incl_process_and_on_order',
+  'assembly_completion_pct', 'sub_builds_completed', 'suppliers_on_time_pct_30d']);
+
+async function get_changes(productArg, daysBackArg) {
+  const product = String(productArg || 'RLL').toUpperCase().replace(/\s+/g, '') === 'GRN' ? 'GRN40' : String(productArg || 'RLL').toUpperCase();
+  const daysBack = Math.max(1, parseInt(daysBackArg) || 1);
+  const { data, error } = await supabase.from('production_snapshots')
+    .select('snapshot_date, product, figures, stuck_items, gaps, taken_at')
+    .eq('product', product).order('snapshot_date', { ascending: false }).limit(60);
+  if (error) return { error: `production_snapshots: ${error.message}` };
+  if (!data || !data.length) return { error: `No daily snapshots for ${product} yet — the first one is taken by the scheduled job (or an Admin run).` };
+  const latest = data[0];
+  const cutoff = saDate(new Date(Date.parse(latest.snapshot_date + 'T12:00:00Z') - daysBack * DAY_MS).toISOString());
+  const prev = data.find(r => r.snapshot_date <= cutoff);
+  if (!prev) return { error: `Only ${data.length} snapshot(s) for ${product} so far (latest ${latest.snapshot_date}); none from ${daysBack} day(s) earlier to compare with.`,
+    latest_snapshot: latest.snapshot_date };
+
+  const a = prev.figures || {}, b = latest.figures || {};
+  const keys = [...new Set([...Object.keys(a), ...Object.keys(b)])];
+  const changes = [], unchanged = [], missing = [];
+  for (const k of keys) {
+    const was = a[k], now = b[k];
+    const label = FIG_LABELS[k] || k.replace(/_/g, ' ');
+    if (was == null || now == null) { missing.push({ figure: label, was: was ?? 'not recorded', now: now ?? 'not recorded' }); continue; }
+    const delta = r2(num(now) - num(was));
+    if (!delta) { unchanged.push(label); continue; }
+    const better = UP_IS_GOOD.has(k) ? delta > 0 : delta < 0;
+    changes.push({ figure: label, was, now, change: delta > 0 ? `+${delta}` : `${delta}`, direction: better ? 'better' : 'worse' });
+  }
+  changes.sort((x, y) => (x.direction === 'worse' ? 0 : 1) - (y.direction === 'worse' ? 0 : 1));
+  const keyOf = i => `${i.kind}|${i.ref}`;
+  const before = new Map((prev.stuck_items || []).map(i => [keyOf(i), i]));
+  const after = new Map((latest.stuck_items || []).map(i => [keyOf(i), i]));
+  const newStuck = [...after.values()].filter(i => !before.has(keyOf(i))).slice(0, 15);
+  const cleared = [...before.values()].filter(i => !after.has(keyOf(i))).slice(0, 15);
+  return {
+    product, compared: `${prev.snapshot_date} → ${latest.snapshot_date}`,
+    latest_taken_at: latest.taken_at,
+    changes, unchanged: unchanged.length ? unchanged : undefined,
+    newly_stuck: newStuck.length ? newStuck : undefined,
+    cleared_since: cleared.length ? cleared : undefined,
+    not_comparable: missing.length ? missing : undefined,
+    snapshot_gaps: (latest.gaps && latest.gaps.length) ? latest.gaps : undefined,
+    note: 'Snapshots are taken once a day, so this shows day-to-day movement, not changes within today. Stuck-item lists compare the top 60 items of each day.'
   };
 }
 
@@ -2574,13 +2751,66 @@ async function query_data(args) {
 
 // ── Router ──────────────────────────────────────────────────────────────────
 
+// ── Step 2 (11-10-2026): every tool result carries where it came from ──────
+// Tables/views each tool reads (checked against the code), and plain names
+// for them. runTool() adds _meta {tool, data_read_at, sources} to every
+// result so each answer can state its source and time.
+const TOOL_SOURCES = {
+  get_rll_shortfall:             ['v_rll_build_readiness', 'stock_items', 'part_lead_times'],
+  get_grn40_shortfall:           ['v_grn40_build_readiness'],
+  get_unit_component_cost:       ['stock_items', 'build_items', 'po_lines', 'supplier_po', 'component_pricing'],
+  get_supplier_performance:      ['po_lines', 'supplier_po', 'po_deliveries', 'rejection_tracking', 'service_orders'],
+  get_time_lost:                 ['po_deliveries', 'service_orders', 'rejection_tracking', 'po_lines', 'supplier_po', 'stock_items', 'component_movements', 'v_rll_build_readiness', 'v_grn40_build_readiness', 'projects'],
+  get_changes:                   ['production_snapshots'],
+  get_rll_units_built:           ['v_rll_build_progress', 'v_rll_build_effective', 'build_dependencies', 'projects', 'weapon_serials'],
+  get_sub_builds_completed:      ['v_rll_build_progress', 'v_rll_build_effective', 'build_dependencies', 'projects'],
+  get_sub_builds_hampering:      ['v_rll_build_progress', 'v_rll_build_effective', 'build_dependencies', 'projects'],
+  get_sub_build_priorities:      ['v_rll_build_progress', 'v_rll_build_effective', 'build_dependencies', 'projects'],
+  get_project_progress:          ['v_rll_build_progress', 'projects'],
+  get_rll_deadline_risk:         ['v_rll_build_readiness', 'stock_items', 'part_lead_times', 'projects'],
+  get_open_work_orders:          ['work_orders', 'service_orders'],
+  get_open_po_value:             ['v_po_payables', 'v_finance_po_reconciliation'],
+  get_payables_summary:          ['v_po_payables'],
+  get_prepaid_limbo:             ['v_po_payables'],
+  get_supplier_spend:            ['v_po_payables'],
+  get_receipt_ageing:            ['po_deliveries', 'po_lines', 'v_po_payables'],
+  get_payment_schedule:          ['v_po_payables', 'v_payment_forecast_lines'],
+  get_po_reconciliation_summary: ['v_finance_po_reconciliation'],
+  get_po_reconciliation_issues:  ['v_finance_po_reconciliation'],
+  get_project_financial_summary: ['projects', 'v_po_line_commitment'],
+  list_projects:                 ['projects'],
+};
+const SOURCE_LABELS = {
+  v_rll_build_readiness: 'RLL Build Readiness', v_grn40_build_readiness: 'GRN40 Build Readiness',
+  v_rll_build_progress: 'Production Progress', v_rll_build_effective: 'Production Progress',
+  build_dependencies: 'Build Sequence rules', stock_items: 'stock records', part_lead_times: 'part lead times',
+  build_items: 'BOM', po_lines: 'PO lines', supplier_po: 'PO headers', component_pricing: 'Component Pricing',
+  po_deliveries: 'deliveries', rejection_tracking: 'Rejection Tracking', service_orders: 'ESO/LSO orders',
+  component_movements: 'stock movements', projects: 'projects', weapon_serials: 'Blue Card serial register',
+  work_orders: 'work orders', v_po_payables: 'PO payables', v_finance_po_reconciliation: 'Finance reconciliation',
+  v_payment_forecast_lines: 'payment forecast', v_po_line_commitment: 'PO commitments',
+  production_snapshots: 'daily production snapshots'
+};
+const saClock = () => new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Johannesburg', day: '2-digit',
+  month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date()).replace(',', '');
+
 async function runTool(name, input) {
+  const out = await runToolCore(name, input || {});
+  const tables = (name === 'query_data' || name === 'list_data_sources')
+    ? [input && input.source].filter(Boolean) : (TOOL_SOURCES[name] || []);
+  const meta = { tool: name, data_read_at: saClock() + ' SAST',
+    sources: [...new Set(tables.map(t => SOURCE_LABELS[t] || t))], tables };
+  return (out && typeof out === 'object' && !Array.isArray(out)) ? { ...out, _meta: meta } : { result: out, _meta: meta };
+}
+
+async function runToolCore(name, input) {
   try {
     if (name === 'get_rll_shortfall')             return await get_rll_shortfall(input.qty || 1);
     if (name === 'get_grn40_shortfall')           return await get_grn40_shortfall(input.qty || 1);
     if (name === 'get_unit_component_cost')       return await get_unit_component_cost(input.product, input.show_all === true, input.assembly, input.qty);
     if (name === 'get_supplier_performance')      return await get_supplier_performance(input.supplier, input.days_back, input.show_all === true);
     if (name === 'get_time_lost')                 return await get_time_lost(input.product, input.show_all === true);
+    if (name === 'get_changes')                   return await get_changes(input.product, input.days_back);
     if (name === 'get_rll_units_built')           return await get_rll_units_built();
     if (name === 'get_sub_builds_completed')      return await get_sub_builds_completed();
     if (name === 'get_sub_builds_hampering')      return await get_sub_builds_hampering();
@@ -2608,30 +2838,51 @@ async function runTool(name, input) {
 
 // ── Handler ─────────────────────────────────────────────────────────────────
 
-exports.handler = async function (event) {
-  if (event.httpMethod !== 'POST')
-    return { statusCode: 405, body: 'Method Not Allowed' };
+// ── Conversation engine (shared by chat.js and chat-background.js) ─────────
+// Runs the think → read data → think loop for one question within a time
+// budget, writes the question log, and returns the final response.
+//   budgetMs   26 000 for the normal function (Netlify cuts it at 30 s),
+//              300 000 for chat-background.js (Netlify allows 15 min).
+// Prompt caching (11-10-2026): the long instructions and the tool list are
+// marked cacheable, so each research round after the first starts faster.
+// The date line is a separate, uncached block so the cache survives the day.
 
+const LIMIT_TEXT = ms => ms >= 60000 ? `${Math.round(ms / 60000)} minutes` : `${Math.round(ms / 1000) + 4} seconds`;
+
+async function runConversation({ messages, user, budgetMs, maxRounds = 8, tag = 'chat' }) {
   const started = Date.now();
-  const BUDGET_MS = 52000;     // Netlify cuts synchronous functions off at 60s
   const elapsed = () => Date.now() - started;
-  const say = text => ({ statusCode: 200, headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ stop_reason: 'end_turn', content: [{ type: 'text', text }] }) });
+  const textResponse = text => ({ stop_reason: 'end_turn', content: [{ type: 'text', text }] });
+
+  const who = String(user || '').trim().slice(0, 80) || null;
+  const lastUser = [...(messages || [])].reverse().find(m => m.role === 'user');
+  const question = lastUser ? (typeof lastUser.content === 'string' ? lastUser.content
+    : (lastUser.content || []).filter(c => c.type === 'text').map(c => c.text).join(' ')) : '';
+  const toolsUsed = [];
+  const logTurn = async (outcome, answerText) => {
+    try {
+      const { error } = await supabase.from('bot_question_log').insert({
+        asked_by: who, question: String(question || '').slice(0, 4000),
+        tools_used: toolsUsed, outcome, answer: String(answerText || '').slice(0, 8000), ms: elapsed() });
+      if (error) console.log(`[${tag}] question log not written: ${error.message}`);
+    } catch (e) { console.log(`[${tag}] question log not written: ${e.message}`); }
+  };
+  const finish = async (text, outcome) => { await logTurn(outcome, text); return { response: textResponse(text), outcome }; };
 
   try {
-    const { messages } = JSON.parse(event.body);
-    let conversation  = [...messages];
-    let finalResponse = null;
-
+    const conversation = [...(messages || [])];
     const todayStr = new Date().toISOString().slice(0, 10);
-    const systemWithDate = SYSTEM_PROMPT
-      + `\n\nTODAY'S DATE: ${todayStr}. Days remaining to the 2026 400 RLL delivery deadline (${DEADLINE_400}): ${daysUntil(DEADLINE_400)}.`;
+    const system = [
+      { type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: `TODAY'S DATE: ${todayStr}. Days remaining to the 2026 400 RLL delivery deadline (${DEADLINE_400}): ${daysUntil(DEADLINE_400)}.` }
+    ];
+    const tools = TOOLS.map((t, k) => k === TOOLS.length - 1 ? { ...t, cache_control: { type: 'ephemeral' } } : t);
 
-    for (let i = 0; i < 8; i++) {
-      const remaining = BUDGET_MS - elapsed();
+    for (let i = 0; i < maxRounds; i++) {
+      const remaining = budgetMs - elapsed();
       if (remaining < 8000) {
-        console.log(`[chat] out of time before iteration ${i} at ${elapsed()}ms`);
-        return say('That question needed more time than this chat allows (60 seconds). Please ask for a narrower version — for example "top 10 only", or one tool at a time — and I will answer it straight away.');
+        console.log(`[${tag}] out of time before round ${i} at ${elapsed()}ms`);
+        return await finish(`That question needed more time than the bot allows (${LIMIT_TEXT(budgetMs)}). Please split it into two questions and I will answer each straight away.`, 'timeout');
       }
       const t0 = Date.now();
       let res;
@@ -2644,46 +2895,91 @@ exports.handler = async function (event) {
             'x-api-key':         ANTHROPIC_API_KEY,
             'anthropic-version': '2023-06-01'
           },
-          body: JSON.stringify({
-            model:      'claude-sonnet-4-6',
-            max_tokens: 2400,
-            system:     systemWithDate,
-            tools:      TOOLS,
-            messages:   conversation
-          })
+          body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 2400, system, tools, messages: conversation })
         });
       } catch (e) {
-        console.log(`[chat] Claude call ${i} aborted after ${Date.now() - t0}ms: ${e.message}`);
-        return say('The answer took too long to write and was cut off at the 60-second limit. Please ask for a shorter version (for example "top 10 only") and I will answer it straight away.');
+        console.log(`[${tag}] Claude call ${i} aborted after ${Date.now() - t0}ms: ${e.message}`);
+        return await finish(`The answer took too long to write and was stopped at the ${LIMIT_TEXT(budgetMs)} limit. Please split the question and I will answer it straight away.`, 'timeout');
       }
       const data = await res.json();
-      console.log(`[chat] Claude call ${i}: ${Date.now() - t0}ms, stop=${data.stop_reason}, out_tokens=${data.usage && data.usage.output_tokens}`);
+      const u = data.usage || {};
+      console.log(`[${tag}] Claude call ${i}: ${Date.now() - t0}ms, stop=${data.stop_reason}, out=${u.output_tokens}, cache_read=${u.cache_read_input_tokens || 0}`);
 
       if (data.stop_reason === 'tool_use') {
         conversation.push({ role: 'assistant', content: data.content });
-        const tools = data.content.filter(b => b.type === 'tool_use');
-        const results = await Promise.all(tools.map(async block => {
+        const calls = data.content.filter(b => b.type === 'tool_use');
+        const results = await Promise.all(calls.map(async block => {
           const t1 = Date.now();
-          const out = JSON.stringify(await runTool(block.name, block.input));
-          console.log(`[chat] tool ${block.name}: ${Date.now() - t1}ms, ${out.length} chars`);
+          const r = await runTool(block.name, block.input);
+          const out = JSON.stringify(r);
+          toolsUsed.push({ tool: block.name, input: block.input, ms: Date.now() - t1, error: (r && r.error) || undefined });
+          console.log(`[${tag}] tool ${block.name}: ${Date.now() - t1}ms, ${out.length} chars`);
           return { type: 'tool_result', tool_use_id: block.id, content: out };
         }));
         conversation.push({ role: 'user', content: results });
         continue;
       }
-      finalResponse = data;
-      break;
+      console.log(`[${tag}] done in ${elapsed()}ms`);
+      const answerText = (data.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n');
+      const outcome = data.error ? 'api_error' : 'answered';
+      await logTurn(outcome, answerText || JSON.stringify(data.error || ''));
+      return { response: data, outcome };
     }
-
-    if (!finalResponse) return say('I could not finish that in the allowed steps. Please ask a narrower question.');
-    console.log(`[chat] done in ${elapsed()}ms`);
-    return {
-      statusCode: 200,
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(finalResponse)
-    };
+    return await finish('I could not finish that in the allowed steps. Please split the question into two.', 'too_many_steps');
   } catch (err) {
-    console.log(`[chat] error after ${elapsed()}ms: ${err.message}`);
-    return { statusCode: 500, body: JSON.stringify({ error: err.message }) };
+    console.log(`[${tag}] error after ${elapsed()}ms: ${err.message}`);
+    await logTurn('error', err.message);
+    return { response: { error: err.message }, outcome: 'error' };
   }
+}
+
+const isUuid = v => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v || ''));
+
+// ── Handler (normal, 30-second function) ────────────────────────────────────
+// Modes:  {mode:"status", job_id}       → progress/answer of a background question (no secret; ids are random)
+//         {mode:"snapshot"|"tool", …}   → Admin, needs x-bot-secret
+//         {messages, user}              → answer directly within 26 s (fallback when the background function is unavailable)
+exports.handler = async function (event) {
+  if (event.httpMethod !== 'POST')
+    return { statusCode: 405, body: 'Method Not Allowed' };
+  const started = Date.now();
+  const elapsed = () => Date.now() - started;
+  const json = (o, code = 200) => ({ statusCode: code, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(o) });
+
+  let body = {};
+  try { body = JSON.parse(event.body || '{}'); } catch { return { statusCode: 400, body: 'Bad JSON' }; }
+
+  if (body.mode === 'status') {
+    if (!isUuid(body.job_id)) return json({ error: 'bad job_id' }, 400);
+    const { data, error } = await supabase.from('bot_jobs')
+      .select('status, result, error, created_at, started_at, finished_at').eq('id', body.job_id).limit(1);
+    if (error) return json({ status: 'unknown', error: `bot_jobs: ${error.message}` });
+    if (!data || !data.length) return json({ status: 'waiting' });   // background run has not written its row yet
+    return json(data[0]);
+  }
+
+  // ── Admin modes (Step 3 tests, Step 4 snapshot) — need the BOT_ADMIN_SECRET
+  if (body.mode === 'snapshot' || body.mode === 'tool') {
+    const hdr = event.headers || {};
+    const given = hdr['x-bot-secret'] || hdr['X-Bot-Secret'] || '';
+    if (!BOT_ADMIN_SECRET || given !== BOT_ADMIN_SECRET) return json({ error: 'unauthorised' }, 401);
+    if (body.mode === 'snapshot') {
+      const products = Array.isArray(body.products) && body.products.length ? body.products : ['RLL'];
+      const results = [];
+      for (const p of products) results.push(await saveSnapshot(p));
+      return json({ mode: 'snapshot', results, ms: elapsed() });
+    }
+    if (!body.tool || !TOOL_SOURCES[body.tool] && !['query_data', 'list_data_sources'].includes(body.tool))
+      return json({ error: `Unknown tool "${body.tool}"` });
+    return json({ mode: 'tool', tool: body.tool, result: await runTool(body.tool, body.input || {}), ms: elapsed() });
+  }
+
+  // ── Direct answer within Netlify's 30 s (fallback path) ──
+  const { response, outcome } = await runConversation({ messages: body.messages, user: body.user, budgetMs: 26000, tag: 'chat' });
+  return json(response, outcome === 'error' ? 500 : 200);
 };
+
+// Shared with chat-background.js
+exports.runConversation = runConversation;
+exports.isUuid = isUuid;
+exports.supabase = supabase;
