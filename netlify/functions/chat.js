@@ -609,46 +609,49 @@ function daysUntil(isoDate) {
   return Math.round((d - today) / 86400000);
 }
 
-// ── Shared BOM shortfall logic (unchanged behaviour) ────────────────────────
+// ── Shared BOM shortfall logic ──────────────────────────────────────────────
+// 22-10-2026: a part can go into more than one assembly (its Dep Code parent
+// plus build_items extras — e.g. the RLL front grip QUAD RAIL is in FRONT
+// GRIP BOTTOM ASSEMBLY and in RLL COMPLETE). v_rll_build_readiness then has
+// one line per use, each carrying the SAME stock, holding and on-order
+// figures. Lines with the same stock_item_id are combined into one line here
+// (needs added, stock counted once), with a used_in breakdown, so the stock
+// is not counted twice. Rows without stock_item_id (GRN40 view) and parts
+// with a single line are unchanged.
 
-function buildShortfallResult(allRows, qty, needCol) {
-  const scaledRows = allRows.map(row => ({
-    ...row,
-    scaled_need: (row[needCol] || 0) * qty
-  }));
-  const byId = {};
-  for (const row of scaledRows) if (row.component_id) byId[row.component_id] = row;
-
-  function effectiveNeed(row) {
-    const parent = row.dependant_code ? byId[row.dependant_code] : null;
-    if (!parent) return row.scaled_need;
-    if (parent.available_qty >= parent.scaled_need) return 0;
-    return Math.max(0, parent.scaled_need - parent.available_qty) * row.req_per_unit;
+function sharedPartsMerge(needs, byId) {
+  const groups = new Map();
+  for (const n of needs) {
+    const k = n.row.stock_item_id;
+    if (k == null) continue;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(n);
   }
-
-  return scaledRows
-    .filter(row => {
-      if (row.build_status === 'CONTAINER') return false;
-      const parent = row.dependant_code ? byId[row.dependant_code] : null;
-      if (parent && parent.available_qty >= parent.scaled_need) return false;
-      const need = effectiveNeed(row);
-      return Math.max(0, need - row.available_qty - row.holding_qty - row.on_order_qty) > 0;
-    })
-    .map(r => {
-      const need = effectiveNeed(r);
-      const needsSourcing = Math.max(0, need - r.available_qty - r.holding_qty - r.on_order_qty);
-      const out = {
-        item_name: r.item_name, stock_code: r.stock_code, storeroom: r.storeroom,
-        available: r.available_qty, holding_wip: r.holding_qty, on_order: r.on_order_qty,
-        supplier_eta: r.supplier_earliest_eta, needed: need, needs_sourcing: needsSourcing,
-      };
-      if ((r.wo_committed_qty || 0) > 0) out.wo_committed = r.wo_committed_qty;
-      if ((r.so_committed_qty || 0) > 0) out.so_committed = r.so_committed_qty;
-      return out;
+  const out = [];
+  const done = new Set();
+  for (const n of needs) {
+    const k = n.row.stock_item_id;
+    const g = k == null ? null : groups.get(k);
+    if (!g || g.length < 2) { out.push(n); continue; }
+    if (done.has(k)) continue;
+    done.add(k);
+    // Dep Code line first, then the extras (same order as the view's allocation)
+    const lines = [...g].sort((a, b) =>
+      ((a.row.link_type === 'EXTRA') - (b.row.link_type === 'EXTRA')) || ((a.row.depth || 0) - (b.row.depth || 0)));
+    const first = lines[0];
+    const used_in = lines.map(x => {
+      const p = x.row.dependant_code ? byId[x.row.dependant_code] : null;
+      return { in: p ? p.item_name : (x.row.dependant_code === 'RLLMB1' ? 'RLL COMPLETE' : x.row.dependant_code),
+               per_unit: x.row.req_per_unit, needed: x.need };
     });
+    out.push({ row: { ...first.row, used_in }, orig: first.orig, need: lines.reduce((t, x) => t + x.need, 0) });
+  }
+  return out;
 }
 
-// Same effective-need logic, but returns every non-container row with its need
+// Effective need of every non-container row (a part under an assembly that
+// is already in stock for this quantity needs nothing more), shared parts
+// combined.
 function computeNeeds(allRows, qty, needCol) {
   const scaled = allRows.map(row => ({ ...row, scaled_need: (row[needCol] || 0) * qty }));
   const byId = {};
@@ -664,6 +667,24 @@ function computeNeeds(allRows, qty, needCol) {
     else if (parent.available_qty >= parent.scaled_need) need = 0;
     else need = Math.max(0, parent.scaled_need - parent.available_qty) * row.req_per_unit;
     out.push({ row, orig, need });
+  }
+  return sharedPartsMerge(out, byId);
+}
+
+function buildShortfallResult(allRows, qty, needCol) {
+  const out = [];
+  for (const { row: r, need } of computeNeeds(allRows, qty, needCol)) {
+    const needsSourcing = Math.max(0, need - r.available_qty - r.holding_qty - r.on_order_qty);
+    if (needsSourcing <= 0) continue;
+    const o = {
+      item_name: r.item_name, stock_code: r.stock_code, storeroom: r.storeroom,
+      available: r.available_qty, holding_wip: r.holding_qty, on_order: r.on_order_qty,
+      supplier_eta: r.supplier_earliest_eta, needed: need, needs_sourcing: needsSourcing,
+    };
+    if ((r.wo_committed_qty || 0) > 0) o.wo_committed = r.wo_committed_qty;
+    if ((r.so_committed_qty || 0) > 0) o.so_committed = r.so_committed_qty;
+    if (r.used_in) o.used_in = r.used_in;
+    out.push(o);
   }
   return out;
 }
@@ -684,7 +705,7 @@ const RLL_READINESS_COLS =
   'component_id, dependant_code, item_name, stock_code, storeroom, '
   + 'available_qty, wo_committed_qty, so_committed_qty, holding_qty, '
   + 'on_order_qty, supplier_earliest_eta, need_for_1_rll, req_per_unit, '
-  + 'shortfall, build_status, is_assembly_group';
+  + 'shortfall, build_status, is_assembly_group, depth, stock_item_id, link_type';
 
 // ── Stock tools ──────────────────────────────────────────────────────────────
 
@@ -1269,7 +1290,10 @@ async function get_time_lost(productArg, showAll) {
   // Parts of this product: per-gun quantity and current shortage (from the
   // BOM readiness view). XRGL40 has no readiness view — every item is listed
   // without a guns figure.
-  const perGun = new Map(), shortNow = new Set();
+  // 22-10-2026: a part used in two assemblies has two lines (same stock) —
+  // its per-gun figure is the sum, and "short now" compares the stock once
+  // against the combined need.
+  const perGun = new Map(), shortNow = new Set(), availBy = new Map();
   let bomNote = null;
   let target = null;
   if (product === 'RLL') {
@@ -1277,15 +1301,18 @@ async function get_time_lost(productArg, showAll) {
     target = targetFromProject(pr);
   }
   if (view) {
-    const bom = await fetchAll(view.v, `stock_code, item_name, available_qty, holding_qty, on_order_qty, build_status, ${view.need}`, { order: 'stock_code' });
+    const bom = await fetchAll(view.v, `stock_code, item_name, available_qty, holding_qty, on_order_qty, build_status, ${view.need}${product === 'RLL' ? ', stock_item_id' : ''}`, { order: 'stock_code' });
     if (bom.error) bomNote = `BOM view could not be read (${bom.error}); guns figure not available.`;
     else for (const r of bom.data) {
       if (r.build_status === 'CONTAINER') continue;
       const k = partBase(r.stock_code), q = num(r[view.need]);
       if (!k || q <= 0) continue;
       perGun.set(k, (perGun.get(k) || 0) + q);
-      if (target && num(r.available_qty) < q * target) shortNow.add(k);
+      const id = r.stock_item_id != null ? r.stock_item_id : `row${availBy.size}`;
+      const a = availBy.get(id) || { k, avail: num(r.available_qty), q: 0 };
+      a.q += q; availBy.set(id, a);
     }
+    if (target) for (const a of availBy.values()) if (a.avail < a.q * target) shortNow.add(a.k);
   } else bomNote = 'XRGL40 has no BOM readiness view the assistant can read — items are listed without a "guns held" figure and are not limited to XRGL40 parts.';
 
   const inProduct = (code, po) => view ? perGun.has(partBase(code)) : (!po || d.productOf(po) === product || !d.productOf(po));
@@ -1998,6 +2025,7 @@ async function get_rll_deadline_risk(qtyArg, showAll) {
     const avail = num(r.available_qty), hold = num(r.holding_qty), oo = num(r.on_order_qty);
     const gapAfterStockAndWip = Math.max(0, need - avail - hold);
     const base = { item_name: r.item_name, stock_code: r.stock_code, storeroom: r.storeroom, needed: need };
+    if (r.used_in) base.used_in = r.used_in;
 
     // Process-stuck: Holding Store WIP is what bridges the gap
     if (hold > 0 && need - avail > 0) {
