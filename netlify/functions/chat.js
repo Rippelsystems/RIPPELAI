@@ -734,8 +734,10 @@ async function get_grn40_shortfall(qty = 1) {
 // line:
 //   BOM:    stock_items. Children of an assembly = rows whose dependant_code
 //           equals the assembly's component_id, same product (case-
-//           insensitive retry), qty = build_req (default 1). If none, the
-//           build_items fallback. A child with zero stock is swapped for
+//           insensitive retry), qty = build_req (default 1), plus every
+//           build_items row of the assembly (22-10-2026: always, not only
+//           when there are no Dep Code children; a part on both has the
+//           quantities added). A child with zero stock is swapped for
 //           another row with the same item_name + stock_code + product that
 //           has stock (_get_bom_fast).
 //   Cost:   a row with its own children = the sum of its children (never a
@@ -803,6 +805,7 @@ async function get_unit_component_cost(productArg, showAll, assemblyArg, qtyArg)
     if (bomCache.has(id)) return bomCache.get(id);
     const asm = byId.get(id);
     let bom = [];
+    const childRowIds = [];   // 22-10-2026: each line's own row id
     if (asm) {
       const pcid = String(asm.component_id || '').trim();
       const prod = String(asm.product || '').trim();
@@ -821,18 +824,34 @@ async function get_unit_component_cost(productArg, showAll, assemblyArg, qtyArg)
               if (alt.id !== c.id && num(alt.stock_qty) > 0) { rid = alt.id; break; }
             }
           }
+          childRowIds.push(c.id);
           bom.push({ id: rid, item_name: c.item_name || '', stock_code: c.stock_code || '',
             supplier_code: c.supplier_code || '', qty_required: num(c.build_req) || 1,
             storeroom: c.storeroom || '' });
         }
       }
-      if (!bom.length) {
-        const seen = new Set();
-        for (const r of (biByAsm.get(id) || [])) {
-          if (seen.has(r.component_id)) continue;
-          seen.add(r.component_id);
-          const c = byId.get(r.component_id);
-          if (c) bom.push({ id: c.id, item_name: c.item_name || '', stock_code: c.stock_code || '',
+      // 22-10-2026 — EXTRA USES (build_items), same as db_manager.get_bom
+      // f0756d8d / frm_costing.py 22-10: always added on top of the Dep Code
+      // children (RLL: QUAD RAIL x3, SCREW FRONT CLAMP x6, CLAMP FRONT RAIL
+      // x1, SCREW SLING x1 straight into RLL COMPLETE). Before, only read
+      // when an assembly had no Dep Code children, so they were left out of
+      // the unit cost. A part already on the BOM has the qty added.
+      const onBom = new Map();
+      bom.forEach((b, i) => { if (!onBom.has(b.id)) onBom.set(b.id, i); });
+      childRowIds.forEach((cid, i) => { if (!onBom.has(cid)) onBom.set(cid, i); });
+      const seen = new Set();
+      for (const r of (biByAsm.get(id) || [])) {
+        if (seen.has(r.component_id)) continue;
+        seen.add(r.component_id);
+        if (onBom.has(r.component_id)) {
+          const line = bom[onBom.get(r.component_id)];
+          line.qty_required = (num(line.qty_required) || 0) + (num(r.qty_required) || 0);
+          continue;
+        }
+        const c = byId.get(r.component_id);
+        if (c) {
+          onBom.set(c.id, bom.length);
+          bom.push({ id: c.id, item_name: c.item_name || '', stock_code: c.stock_code || '',
             supplier_code: c.supplier_code || '', qty_required: num(r.qty_required) || 1,
             storeroom: c.storeroom || '' });
         }
