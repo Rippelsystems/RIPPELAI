@@ -272,6 +272,13 @@ PART AUDIT — WHERE ARE THE PARTS (component trace):
   difference, say it is not accounted for, give the tool's gaps word for
   word, and stop. The people asking do not have the background to correct a
   guess.
+- Show "Less: over-delivered" as a MINUS figure, exactly as the tool gives it,
+  so the table visibly adds up to the ordered figure.
+- Name process steps only as the tool names them (e.g. "_C (castings)",
+  "_ANNEAL (annealed)"). Never guess what a suffix means. Holding Store
+  parts are parts between process steps, not parts "in" a process.
+- "Possible causes" in a gap are NOT findings — say they are possible causes
+  that have not been checked, never state them as what happened.
 - HAMMER, TRIGGER, CHANGE LEVER and COVER FRONT are bought on one PO for both
   2026 400 RLL and 2026 1100 XRGL: ISOs, ESOs or WOs for them under either
   contract are normal, never a wrong allocation.
