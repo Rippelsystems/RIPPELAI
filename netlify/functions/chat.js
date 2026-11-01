@@ -30,6 +30,15 @@
 //      question's progress/answer from public.bot_jobs. Prompt caching on the
 //      instructions and tool list. Direct answers (26 s) still work as a
 //      fallback. Tools and rules unchanged.
+//
+// 01-11-2026: added get_part_position — "where are the hammers?": ONE answer
+//   for a whole part (all batches / contracts): ordered → accepted / waiting
+//   QC / rejected at supplier / still to come, then where the accepted parts
+//   are now (Holding per step, at suppliers, ISO, store, WO, built, scrapped)
+//   with a NOT ACCOUNTED FOR line and the gaps. It calls the database
+//   function public.part_position() — the SAME function the Matrix Component
+//   Lifecycle Report (Σ Part totals tab) uses, so both always agree.
+//   Read-only.
 // ============================================================
 
 const { createClient } = require('@supabase/supabase-js');
@@ -225,6 +234,48 @@ FINANCE / PO RULES (permanent business knowledge):
   are empty). Never state profit, margin or budget remaining for a project
   until a tool returns real values. Say the data has not been captured yet.
 
+PART AUDIT — WHERE ARE THE PARTS (component trace):
+- "Where are the hammers", "trace <part>", "how many <part> did we order and
+  where are they", "audit trail for <part / PO line>", "are any waiting for
+  replacement" -> get_part_position with the part number, name or PO line.
+- Answer in this order, short and simple, as TWO compact tables:
+  1) Ordered N — then "From the supplier": accepted, waiting for QC, rejected
+     still at the supplier, still to come, closed short, over-delivered. Its
+     total equals the ordered figure — say so.
+  2) "Where the N accepted parts are now": Holding Store (per step), out at a
+     supplier for a process, on ISO/LSO, back waiting for QC, fell out later,
+     in store ready for build, on open Work Orders (which WOs), built into
+     assemblies, scrapped/issued, lost at count, and NOT ACCOUNTED FOR.
+  Leave out lines that are 0, except NOT ACCOUNTED FOR — always show it.
+- NOT ACCOUNTED FOR should be 0. If it is not 0, say plainly that Matrix does
+  not balance for this part and list the tool's gaps word for word. Below 0
+  means Matrix shows MORE parts than were accepted (usually process returns
+  booked in while the rows they left were not booked out). Never explain it
+  away, never adjust a figure, never recompute the buckets yourself.
+- If the tool returns candidates (a name fits several parts, e.g. two parts
+  both called HAMMER), list them with part number and product and ask which
+  one. Never add different part numbers together because they share a name.
+  Say the same figures are on the Matrix Component Lifecycle Report, tab
+  "Σ Part totals".
+- HARD RULES for any question about the QUANTITY of a part (ordered,
+  received, where, missing, accounted for, waiting for replacement, out on
+  ISO / ESO / annealing): ALWAYS use get_part_position. NEVER add up PO lines
+  or stock rows yourself with query_data for these questions. One part has
+  several PO lines for its process steps (annealing, machining, X-ray,
+  treatment — even on a normal -R PO): they are the SAME parts going through
+  the next step, so adding them counts the parts two or three times.
+- NEVER count qty_internal or qty_external as stock or "WIP" — they are
+  running counters, not parts on the shelf.
+- NEVER give a reason for a difference that a tool did not return (not
+  "consumed in builds, which is expected", not "a project allocation error",
+  not "movements are not being recorded"). If the tool does not explain a
+  difference, say it is not accounted for, give the tool's gaps word for
+  word, and stop. The people asking do not have the background to correct a
+  guess.
+- HAMMER, TRIGGER, CHANGE LEVER and COVER FRONT are bought on one PO for both
+  2026 400 RLL and 2026 1100 XRGL: ISOs, ESOs or WOs for them under either
+  contract are normal, never a wrong allocation.
+
 SOURCE AND TIME ON EVERY ANSWER:
 - Every tool result has _meta with sources (plain names) and data_read_at.
   End every answer that uses tool data with ONE short line:
@@ -240,7 +291,9 @@ R (ZAR). Be concise and direct — these are busy operational stakeholders.
 GENERAL QUESTIONS (no specific tool fits): use list_data_sources, then
 list_data_sources(source) to get that source's REAL columns, then query_data
 (filters, sorting, or group_by with sum_columns for totals). Never guess a
-column name. Prefer a specific tool when one fits. Use at most three or four
+column name. Prefer a specific tool when one fits. Never use query_data to
+count how many of a part were ordered, received or are where — that is
+get_part_position. Use at most three or four
 query_data calls per answer, and say plainly if the data needed is not in any
 available source. Remember "po_lines" values exclude 15% VAT and Finance pays
 per PO, not per line.
@@ -554,6 +607,21 @@ const TOOLS = [
       + 'exist, or names a project ambiguously and you need to find the '
       + 'exact project_name to pass to get_project_financial_summary.',
     input_schema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'get_part_position',
+    description: 'Component audit trail for ONE part across all its batches and '
+      + 'contracts: how many were ordered (original order), how many are '
+      + 'accepted, waiting for QC, rejected and still at the supplier / waiting '
+      + 'for replacement, still to come; then where the accepted parts are now '
+      + '(Holding Store per process step, out at a supplier for a process, on '
+      + 'ISO/LSO, in store ready for build, on open Work Orders, built into '
+      + 'assemblies, scrapped) and how many are NOT ACCOUNTED FOR, with the gaps. '
+      + 'Same figures as the Matrix Component Lifecycle Report "Σ Part totals" '
+      + 'tab. Use for "where are the <part>", "trace <part>", "audit <part>".',
+    input_schema: { type: 'object', properties: {
+      part: { type: 'string', description: 'Part number (e.g. 1E1-3D-CA, suffix allowed), part name (e.g. HAMMER) or PO line reference (e.g. POA31125-R/7-B1).' }
+    }, required: ['part'] }
   }
 ];
 
@@ -2798,6 +2866,41 @@ async function query_data(args) {
 
 // ── Router ──────────────────────────────────────────────────────────────────
 
+// ── 01-11-2026: get_part_position — one database function for bot + Matrix ─
+// public.part_position(p_query) does every calculation (read-only, SQL
+// part_position_01Nov.sql). The bot only passes it through, so the bot and
+// the Matrix screen can never disagree.
+async function get_part_position(partArg) {
+  const q = String(partArg || '').trim();
+  if (!q) return { error: 'Give a part number, part name or PO line reference.' };
+  const { data, error } = await supabase.rpc('part_position', { p_query: q });
+  if (error) {
+    const missing = /part_position/i.test(error.message || '') && /(exist|find|schema cache)/i.test(error.message || '');
+    return { error: missing
+      ? 'The part totals function is not installed on this database yet (part_position_01Nov.sql).'
+      : `part_position failed: ${error.message}` };
+  }
+  const res = Array.isArray(data) ? data[0] : data;
+  if (!res) return { error: 'part_position returned nothing.' };
+  if (!res.ok) return { error: res.error, candidates: res.candidates || undefined };
+  const keep = b => num(b.qty) !== 0;
+  return {
+    part_no: res.part_no, item_name: res.item_name, data_as_at: res.read_at,
+    ordered: res.ordered,
+    from_the_supplier: (res.supplier_side || []).filter(keep).map(b => ({ what: b.label, qty: num(b.qty) })),
+    from_the_supplier_total: num(res.supplier_total),
+    accepted: num(res.accepted),
+    where_now: (res.where_now || []).filter(keep).map(b => ({ what: b.label, qty: num(b.qty) })),
+    not_accounted_for: num(res.not_accounted),
+    holding_by_step: res.holding_by_step, stores: res.stores,
+    open_work_orders: res.open_work_orders, open_service_orders: res.open_service_orders,
+    processing_orders: res.processing_orders,
+    gaps: res.gaps || [],
+    basis: 'Ordered = the original order of the part (later annealing / machining / X-ray orders are processing of the same parts, not extra parts). '
+      + 'From the supplier adds up to ordered; where-now adds up to accepted; NOT ACCOUNTED FOR is the difference and should be 0.'
+  };
+}
+
 // ── Step 2 (11-10-2026): every tool result carries where it came from ──────
 // Tables/views each tool reads (checked against the code), and plain names
 // for them. runTool() adds _meta {tool, data_read_at, sources} to every
@@ -2826,6 +2929,7 @@ const TOOL_SOURCES = {
   get_po_reconciliation_issues:  ['v_finance_po_reconciliation'],
   get_project_financial_summary: ['projects', 'v_po_line_commitment'],
   list_projects:                 ['projects'],
+  get_part_position:             ['po_lines', 'supplier_po', 'po_deliveries', 'rejection_tracking', 'stock_items', 'service_orders', 'annealing_batches', 'work_orders', 'component_movements'],
 };
 const SOURCE_LABELS = {
   v_rll_build_readiness: 'RLL Build Readiness', v_grn40_build_readiness: 'GRN40 Build Readiness',
@@ -2836,7 +2940,7 @@ const SOURCE_LABELS = {
   component_movements: 'stock movements', projects: 'projects', weapon_serials: 'Blue Card serial register',
   work_orders: 'work orders', v_po_payables: 'PO payables', v_finance_po_reconciliation: 'Finance reconciliation',
   v_payment_forecast_lines: 'payment forecast', v_po_line_commitment: 'PO commitments',
-  production_snapshots: 'daily production snapshots'
+  production_snapshots: 'daily production snapshots', annealing_batches: 'annealing batches'
 };
 const saClock = () => new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Johannesburg', day: '2-digit',
   month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date()).replace(',', '');
@@ -2877,6 +2981,7 @@ async function runToolCore(name, input) {
     if (name === 'list_data_sources')             return await list_data_sources(input.source);
     if (name === 'query_data')                    return await query_data(input);
     if (name === 'list_projects')                 return await list_projects();
+    if (name === 'get_part_position')             return await get_part_position(input.part);
     return { error: `Unknown tool: ${name}` };
   } catch (err) {
     return { error: `Tool ${name} failed: ${err.message}` };
